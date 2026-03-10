@@ -1,11 +1,11 @@
 [theme]
-# Dark academic palette
+# Modern soft palette — Inter font injected via CSS in app.py
 base                     = "dark"
 backgroundColor          = "#1a1a2e"
 secondaryBackgroundColor = "#16213e"
 primaryColor             = "#c9a84c"
 textColor                = "#e8e0d0"
-font                     = "serif"
+font                     = "sans serif"
 
 [server]
 headless             = true

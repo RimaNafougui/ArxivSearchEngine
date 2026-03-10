@@ -266,7 +266,7 @@ def arxiv_abstract_url(pdf_url: str) -> str:
 def confidence_badge(matches: list) -> tuple[str, float, float, str]:
     """Return (label, max_sim, avg_sim, description) from similarity scores."""
     if not matches:
-        return "⚪ No Signal", 0.0, 0.0, "No documents retrieved."
+        return "No Signal", 0.0, 0.0, "No documents retrieved."
 
     sims    = [m["similarity"] for m in matches]
     max_sim = max(sims)
@@ -274,11 +274,11 @@ def confidence_badge(matches: list) -> tuple[str, float, float, str]:
     desc    = f"Best match: {max_sim:.2f} · Average: {avg_sim:.2f} across {len(matches)} chunks"
 
     if max_sim >= 0.70:
-        label = "🟢 High Confidence"
+        label = "High Confidence"
     elif max_sim >= 0.50:
-        label = "🟡 Medium Confidence"
+        label = "Medium Confidence"
     else:
-        label = "🔴 Low Confidence"
+        label = "Low Confidence"
 
     return label, max_sim, avg_sim, desc
 
@@ -322,14 +322,14 @@ def render_source_paper(match: dict, key_prefix: str) -> None:
     link_col1, link_col2 = st.columns(2)
     with link_col1:
         if pdf_url:
-            st.markdown(f"[📄 PDF]({pdf_url})")
+            st.markdown(f"[PDF]({pdf_url})")
     with link_col2:
         if abs_url:
-            st.markdown(f"[🔗 Abstract]({abs_url})")
+            st.markdown(f"[Abstract]({abs_url})")
 
     btn_col1, btn_col2 = st.columns(2)
     with btn_col1:
-        if st.button("📌 Save to Reading List", key=f"save_{key_prefix}_{title[:18]}"):
+        if st.button("Save to Reading List", key=f"save_{key_prefix}_{title[:18]}"):
             save_to_reading_list({
                 "title":     title,
                 "url":       pdf_url,
@@ -337,7 +337,7 @@ def render_source_paper(match: dict, key_prefix: str) -> None:
                 "category":  category,
             })
     with btn_col2:
-        if st.button("📋 Copy BibTeX", key=f"bib_{key_prefix}_{title[:18]}"):
+        if st.button("Copy BibTeX", key=f"bib_{key_prefix}_{title[:18]}"):
             st.code(
                 make_bibtex({"title": title, "url": pdf_url, "published": pub}),
                 language="bibtex",
@@ -432,20 +432,33 @@ for _k, _v in _defaults.items():
 # ── 5. PAGE CONFIG ────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="ArXiv RAG Research Assistant",
-    page_icon="🔬",
+    page_icon=None,
     layout="wide",
+)
+
+# Inject Inter from Google Fonts — overrides Streamlit's built-in sans-serif
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 
 # ── 6. SIDEBAR ────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("🔬 ArXiv RAG")
+    st.title("ArXiv RAG")
     st.caption(f"Model: `{GEMINI_MODEL}`")
     st.divider()
 
     # Student Mode toggle
     st.session_state.student_mode = st.toggle(
-        "🎓 Student Mode",
+        "Student Mode",
         value=st.session_state.student_mode,
         help=(
             "Appends 'Explain this clearly for an undergraduate student "
@@ -463,7 +476,7 @@ with st.sidebar:
     st.divider()
 
     # Session stats
-    st.subheader("📊 Session Stats")
+    st.subheader("Session Stats")
     _n_q  = len(st.session_state.query_history)
     _n_sv = len(st.session_state.reading_list)
     _a_cf = (
@@ -477,7 +490,7 @@ with st.sidebar:
     st.divider()
 
     # Last 5 queries
-    st.subheader("🕑 Recent Queries")
+    st.subheader("Recent Queries")
     _recent = st.session_state.query_history[-5:][::-1]
     if _recent:
         for _h in _recent:
@@ -488,14 +501,14 @@ with st.sidebar:
 
 
 # ── 7. MAIN TITLE & TABS ──────────────────────────────────────────────────────
-st.title("🔬 ArXiv RAG Research Assistant")
+st.title("ArXiv RAG Research Assistant")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "💬 Ask a Question",
-    "📈 Trending This Week",
-    "📚 Reading List",
-    "🗃 Papers Database",
-    "📊 Analytics",
+    "Ask a Question",
+    "Trending This Week",
+    "Reading List",
+    "Papers Database",
+    "Analytics",
 ])
 
 
@@ -512,7 +525,7 @@ Ask anything about AI/ML research. The assistant will:
 """
     )
 
-    comparison_mode = st.checkbox("🔀 Comparison Mode")
+    comparison_mode = st.checkbox("Comparison Mode")
 
     # ── Comparison mode ───────────────────────────────────────────────────────
     if comparison_mode:
@@ -530,7 +543,7 @@ Ask anything about AI/ML research. The assistant will:
                 key="q2_input",
             )
 
-        if st.button("⚡ Compare", type="primary"):
+        if st.button("Compare", type="primary"):
             if query1 and query2:
                 with st.spinner("Retrieving papers for both queries…"):
                     m1 = retrieve_documents(query1, category_filter=selected_categories)
@@ -564,13 +577,13 @@ Ask anything about AI/ML research. The assistant will:
                 })
 
         if st.session_state.cmp_answer:
-            st.markdown("### 🔀 Comparison")
+            st.markdown("### Comparison")
             st.markdown(st.session_state.cmp_answer)
 
-            with st.expander("📚 Source Documents — Query 1"):
+            with st.expander("Source Documents — Query 1"):
                 for _i, _m in enumerate(st.session_state.cmp_matches1):
                     render_source_paper(_m, f"cmp1_{_i}")
-            with st.expander("📚 Source Documents — Query 2"):
+            with st.expander("Source Documents — Query 2"):
                 for _i, _m in enumerate(st.session_state.cmp_matches2):
                     render_source_paper(_m, f"cmp2_{_i}")
 
@@ -581,7 +594,7 @@ Ask anything about AI/ML research. The assistant will:
             placeholder="e.g., How does multi-head attention work in Transformers?",
         )
 
-        if st.button("🔍 Search", type="primary") and query:
+        if st.button("Search", type="primary") and query:
             with st.spinner("Analysing your query…"):
                 action, args = run_agent(query)
 
@@ -660,7 +673,7 @@ Ask anything about AI/ML research. The assistant will:
             _q   = st.session_state.active_query
 
             with b1:
-                if st.button("📝 Summarize in 3 bullets"):
+                if st.button("Summarize in 3 bullets"):
                     with st.spinner("Summarizing…"):
                         res = call_gemini(
                             f"Summarize the following research context in exactly "
@@ -668,10 +681,10 @@ Ask anything about AI/ML research. The assistant will:
                             f"\n\nContext:\n{_ctx}\n\nBullet summary:"
                         )
                     st.session_state.action_result = res or ""
-                    st.session_state.action_label  = "📝 3-Bullet Summary"
+                    st.session_state.action_label  = "3-Bullet Summary"
 
             with b2:
-                if st.button("🔍 Find open problems"):
+                if st.button("Find open problems"):
                     with st.spinner("Identifying open problems…"):
                         res = call_gemini(
                             "Based on the following research papers, what are the main "
@@ -679,11 +692,11 @@ Ask anything about AI/ML research. The assistant will:
                             f"\n\nContext:\n{_ctx}\n\nOpen problems:"
                         )
                     st.session_state.action_result = res or ""
-                    st.session_state.action_label  = "🔍 Open Problems"
+                    st.session_state.action_label  = "Open Problems"
 
             with b3:
                 # Always uses student-mode phrasing regardless of toggle
-                if st.button("🎓 Explain for students"):
+                if st.button("Explain for students"):
                     with st.spinner("Simplifying…"):
                         res = call_gemini(
                             "Explain the following research in simple terms for an "
@@ -692,10 +705,10 @@ Ask anything about AI/ML research. The assistant will:
                             f"Question: {_q}\n\nSimple explanation:"
                         )
                     st.session_state.action_result = res or ""
-                    st.session_state.action_label  = "🎓 Student Explanation"
+                    st.session_state.action_label  = "Student Explanation"
 
             with b4:
-                if st.button("🌐 Related concepts"):
+                if st.button("Related concepts"):
                     with st.spinner("Finding related concepts…"):
                         res = call_gemini(
                             "Based on the following research papers, what adjacent "
@@ -704,7 +717,7 @@ Ask anything about AI/ML research. The assistant will:
                             f"\n\nContext:\n{_ctx}\n\nRelated concepts:"
                         )
                     st.session_state.action_result = res or ""
-                    st.session_state.action_label  = "🌐 Related Concepts"
+                    st.session_state.action_label  = "Related Concepts"
 
             if st.session_state.action_result:
                 st.markdown(f"#### {st.session_state.action_label}")
@@ -712,7 +725,7 @@ Ask anything about AI/ML research. The assistant will:
 
             # ── Top-3 sources in sidebar ──────────────────────────────────────
             with st.sidebar:
-                st.header("📚 Top Sources")
+                st.header("Top Sources")
                 st.caption("Papers most relevant to your query")
                 _seen_s: dict[str, dict] = {}
                 for _m in st.session_state.active_matches:
@@ -737,7 +750,7 @@ Ask anything about AI/ML research. The assistant will:
                         st.divider()
 
             # ── Source documents expander ─────────────────────────────────────
-            with st.expander("📖 View All Source Documents"):
+            with st.expander("View All Source Documents"):
                 for _i, _match in enumerate(st.session_state.active_matches):
                     render_source_paper(_match, f"qa_{_i}")
 
@@ -818,7 +831,7 @@ with tab3:
 
     if not st.session_state.reading_list:
         st.info(
-            "No papers saved yet. Use the '📌 Save to Reading List' buttons "
+            "No papers saved yet. Use the 'Save to Reading List' buttons "
             "when viewing search results."
         )
     else:
@@ -831,32 +844,32 @@ with tab3:
                 _url = _paper.get("url", "#")
                 st.caption(f"{_cat} · {_pub} · [PDF]({_url})")
             with _c_rm:
-                if st.button("🗑", key=f"rm_{_i}", help="Remove"):
+                if st.button("Remove", key=f"rm_{_i}"):
                     st.session_state.reading_list.pop(_i)
                     st.rerun()
             st.divider()
 
         st.subheader("Export")
-        if st.button("📤 Export All as BibTeX"):
+        if st.button("Export All as BibTeX"):
             _all_bib = "\n\n".join(
                 make_bibtex(_p) for _p in st.session_state.reading_list
             )
             st.code(_all_bib, language="bibtex")
 
         # Clear all — requires confirmation step
-        if st.button("🗑 Clear All"):
+        if st.button("Clear All"):
             st.session_state.confirm_clear = True
 
         if st.session_state.confirm_clear:
             st.warning("This will remove all saved papers. Are you sure?")
             _ca, _cb = st.columns(2)
             with _ca:
-                if st.button("✅ Yes, clear all", type="primary"):
+                if st.button("Yes, clear all", type="primary"):
                     st.session_state.reading_list  = []
                     st.session_state.confirm_clear = False
                     st.rerun()
             with _cb:
-                if st.button("❌ Cancel"):
+                if st.button("Cancel"):
                     st.session_state.confirm_clear = False
                     st.rerun()
 
@@ -871,7 +884,7 @@ with tab4:
         all_papers = fetch_all_papers()
 
     _search_title = st.text_input(
-        "🔍 Search by title",
+        "Search by title",
         placeholder="e.g., transformer, diffusion, reinforcement…",
     )
     _year_min, _year_max = st.slider("Year range", 2018, 2025, (2020, 2025))
@@ -925,7 +938,7 @@ with tab4:
                     _links.append(f"[PDF ↗]({_pdf_url})")
                 st.markdown(" · ".join(_links))
             with _col_s:
-                if st.button("📌", key=f"db_{_title[:22]}", help="Save to reading list"):
+                if st.button("Save", key=f"db_{_title[:22]}"):
                     save_to_reading_list({
                         "title":     _title,
                         "url":       _pdf_url,
