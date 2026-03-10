@@ -21,14 +21,22 @@ A **full-stack AI application** that turns the ArXiv research database into a co
 
 | Feature | Description |
 |---|---|
-| **Agentic routing** | Gemini decides whether to search, ask a clarifying question, or politely decline out-of-scope queries — before touching the database |
+| **Agentic routing** | Gemini decides whether to search, ask for clarification, or decline out-of-scope queries — before touching the database |
 | **Semantic search** | Queries are encoded with `all-MiniLM-L6-v2` and matched against stored embeddings using cosine similarity (pgvector) |
 | **RAG generation** | Top retrieved chunks are assembled into a grounded prompt; the LLM can only answer from what the papers say |
 | **Confidence indicator** | Cosine similarity scores drive a 🟢/🟡/🔴 confidence badge shown with every answer |
-| **Top 3 sources sidebar** | The three most relevant papers appear in the sidebar with similarity bars and direct ArXiv abstract links |
-| **Papers Database tab** | Browse or search the full list of indexed papers by title, sorted newest first, with year and links |
-| **Auto model discovery** | At startup the app probes a list of Gemini models newest-first and uses the first one that responds — survives Google deprecations automatically |
-| **Idempotent ETL** | Re-running the pipeline skips already-indexed papers; newest ArXiv papers are fetched first (`sortBy=submittedDate`) |
+| **Comparison mode** | Run two queries side-by-side; Gemini contrasts what the papers say about each topic |
+| **Action buttons** | After any answer: summarise in 3 bullets, find open problems, explain for students, or explore related concepts |
+| **Student Mode** | Sidebar toggle that appends an undergraduate-friendly explanation request to every Gemini prompt |
+| **Category filter** | Sidebar multiselect (cs.AI / cs.LG / cs.CL / cs.CV) filters retrieval results and the Papers Database tab |
+| **Reading List** | Save papers with one click; export all as BibTeX or clear with confirmation |
+| **BibTeX export** | Per-paper and bulk BibTeX generation (`@misc{arxiv_YEAR_slug}` format) |
+| **Trending This Week** | Shows papers indexed in the last 7 days (falls back to 30), with a category bar chart |
+| **Weekly Digest** | One-click Gemini summary of what's new in AI/ML this week based on recent paper titles |
+| **Session Analytics** | Query history table, confidence line chart, category usage bar chart, summary metrics |
+| **Top 3 sources sidebar** | Most relevant papers shown in the sidebar with similarity bars and ArXiv abstract links |
+| **Auto model discovery** | Probes Gemini models newest-first at startup; survives Google deprecations automatically |
+| **Idempotent ETL** | Re-running the pipeline skips already-indexed papers; fetches cs.AI, cs.LG, cs.CL, and cs.CV |
 | **Weekly automation** | GitHub Actions cron runs the ETL every Sunday and pushes new papers into the vector store |
 
 ---
@@ -48,12 +56,12 @@ User query ──► Gemini router  ──► embed query ──► cosine searc
                     Gemini generation  ──►  grounded answer + sources
 ```
 
-1. **Extract** — ArXiv REST API, sorted by submission date descending, category `cs.AI`
-2. **Transform** — `pypdf` text extraction → 500-char chunks (50-char overlap) → `all-MiniLM-L6-v2` embeddings
+1. **Extract** — ArXiv REST API, sorted by submission date descending, categories `cs.AI OR cs.LG OR cs.CL OR cs.CV`
+2. **Transform** — `pypdf` text extraction → 500-char chunks (50-char overlap) → `all-MiniLM-L6-v2` embeddings; primary category stored in metadata
 3. **Load** — Supabase PostgreSQL with `pgvector`; duplicate chunks are skipped on re-runs
 4. **Route** — Gemini classifies each query as *search / clarify / out-of-scope* using a structured JSON prompt
-5. **Retrieve** — pgvector cosine similarity search; results are deduplicated and diversified across papers
-6. **Generate** — Retrieved chunks + question → Gemini prompt → answer grounded in paper text
+5. **Retrieve** — pgvector cosine similarity search; results are deduplicated and diversified across papers; optionally filtered by category
+6. **Generate** — Retrieved chunks + question → Gemini prompt → answer grounded in paper text; Student Mode injects an undergraduate-friendly suffix into every prompt
 
 ---
 
@@ -127,16 +135,30 @@ User query ──► Gemini router  ──► embed query ──► cosine searc
 
 ---
 
+## App Layout (5 tabs)
+
+| Tab | Description |
+|---|---|
+| 💬 **Ask a Question** | Agentic search with comparison mode, 4 action buttons, Save + BibTeX per source |
+| 📈 **Trending This Week** | Recent papers, category breakdown chart, one-click Weekly Digest |
+| 📚 **Reading List** | Saved papers, individual Remove, Export All as BibTeX, Clear All |
+| 🗃 **Papers Database** | Full paper index with title search, year-range slider, category filter |
+| 📊 **Analytics** | Query history, confidence line chart, category usage chart, summary metrics |
+
+---
+
 ## Project Structure
 
 ```
-├── app.py                  # Streamlit UI + agentic router + RAG pipeline
-├── etl_pipeline.py         # Extract → Transform → Load (ArXiv → pgvector)
-├── check_models.py         # Lists available Gemini models for debugging
+├── app.py                    # Streamlit UI — 5 tabs, sidebar, RAG pipeline
+├── etl_pipeline.py           # Extract → Transform → Load (ArXiv → pgvector)
+├── check_models.py           # Lists available Gemini models for debugging
 ├── requirements.txt
-├── ARCHITECTURE.md         # Deep-dive technical design document
+├── ARCHITECTURE.md           # Deep-dive technical design document
+├── .streamlit/
+│   └── config.toml           # Dark academic theme (Hugging Face Spaces)
 ├── .github/workflows/
-│   └── weekly_update.yml   # GitHub Actions ETL cron
+│   └── weekly_update.yml     # GitHub Actions ETL cron (weekly)
 └── .devcontainer/
-    └── devcontainer.json   # GitHub Codespaces config
+    └── devcontainer.json     # GitHub Codespaces config
 ```
