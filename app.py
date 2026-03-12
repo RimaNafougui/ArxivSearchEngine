@@ -88,6 +88,19 @@ def call_gemini(prompt: str) -> str | None:
         return None
 
 
+def stream_gemini(prompt: str):
+    """Yields text chunks from a streaming Gemini call for use with st.write_stream()."""
+    try:
+        for chunk in gemini.models.generate_content_stream(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        ):
+            if chunk.text:
+                yield chunk.text
+    except Exception as e:
+        st.error(f"Gemini streaming error: {e}")
+
+
 def _bibtex_slug(title: str, year: str) -> str:
     words = title.lower().split()[:4]
     slug  = "_".join(w.strip(".,;:!?\"'") for w in words)
@@ -175,9 +188,9 @@ def retrieve_documents(
 
     return result
 
-def build_answer(user_query: str, context_text: str) -> str | None:
-    """Ask Gemini to synthesise a grounded answer from retrieved context."""
-    prompt = (
+def build_answer_prompt(user_query: str, context_text: str) -> str:
+    """Construct the RAG answer prompt (shared by blocking and streaming paths)."""
+    return (
         "You are a helpful AI research assistant. Answer the Question below "
         "using the research paper excerpts in the Context."
         f"{student_suffix()}\n\n"
@@ -191,7 +204,54 @@ def build_answer(user_query: str, context_text: str) -> str | None:
         f"Context:\n{context_text}\n\n"
         f"Question: {user_query}\n\nAnswer:"
     )
-    return call_gemini(prompt)
+
+
+def build_answer(user_query: str, context_text: str) -> str | None:
+    """Ask Gemini to synthesise a grounded answer from retrieved context."""
+    return call_gemini(build_answer_prompt(user_query, context_text))
+
+
+def multihop_retrieve(
+    query: str,
+    category_filter: list | None = None,
+) -> tuple[list, list, str]:
+    """
+    Two-pass retrieval for multi-hop reasoning.
+
+    Pass 1 — retrieve papers for the original query.
+    Concept extraction — ask Gemini for the most important related topic not
+                         yet covered by the Pass-1 results.
+    Pass 2 — retrieve papers for the extracted concept query.
+
+    Returns (pass1_matches, pass2_matches, hop_query).
+    """
+    pass1 = retrieve_documents(query, category_filter=category_filter)
+    if not pass1:
+        return [], [], ""
+
+    ctx1 = context_from_matches(pass1)
+
+    concept_prompt = (
+        "Based on the research paper excerpts below, identify the single most "
+        "important related technical concept that is NOT already directly addressed "
+        "but would help answer the user's question more completely.\n"
+        "Return ONLY a short search query (3–8 words). No explanation.\n\n"
+        f"User question: {query}\n\n"
+        f"Context (first-pass results):\n{ctx1[:2000]}\n\n"
+        "Related search query:"
+    )
+    hop_query = call_gemini(concept_prompt)
+    if not hop_query:
+        return pass1, [], ""
+
+    hop_query = hop_query.strip().strip('"')
+
+    pass2_raw = retrieve_documents(hop_query, category_filter=category_filter)
+    # Exclude papers already surfaced in pass 1
+    pass1_titles = {m["metadata"]["title"] for m in pass1}
+    pass2 = [m for m in pass2_raw if m["metadata"]["title"] not in pass1_titles]
+
+    return pass1, pass2, hop_query
 
 
 def run_agent(user_query: str) -> tuple[str, dict]:
@@ -412,6 +472,11 @@ _defaults = {
     "active_answer":  "",
     "action_result":  "",
     "action_label":   "",
+    # Tab 1 — multi-hop state
+    "hop_query":      "",
+    "hop_matches":    [],
+    "is_multihop":    False,
+    "just_streamed":  False,
     # Tab 1 — comparison mode result cache
     "cmp_answer":     "",
     "cmp_matches1":   [],
@@ -593,6 +658,15 @@ Ask anything about AI/ML research. The assistant will:
             ),
         )
 
+        deep_search = st.checkbox(
+            "Deep Search (Multi-hop)",
+            help=(
+                "Performs two retrieval passes. Pass 1 finds directly relevant papers; "
+                "Gemini then identifies a related concept and Pass 2 finds additional papers "
+                "on that concept. The final answer synthesises both passes."
+            ),
+        )
+
         if st.button("Search", type="primary") and query:
             with st.spinner("Analysing your query…"):
                 action, args = run_agent(query)
@@ -613,37 +687,90 @@ Ask anything about AI/ML research. The assistant will:
 
             else:
                 refined = args.get("refined_query", query)
-                with st.spinner("Searching the vector database…"):
-                    matches = retrieve_documents(
-                        refined, category_filter=selected_categories
-                    )
 
-                if not matches:
-                    st.warning(
-                        "No relevant papers found. Try rephrasing, "
-                        "or ask about a different AI/ML topic."
-                    )
-                    st.session_state.active_answer = ""
+                if deep_search:
+                    # ── Multi-hop path ───────────────────────────────────────
+                    with st.spinner("Pass 1: Searching the vector database…"):
+                        pass1, pass2, hop_query = multihop_retrieve(
+                            refined, category_filter=selected_categories
+                        )
+
+                    if not pass1:
+                        st.warning(
+                            "No relevant papers found. Try rephrasing, "
+                            "or ask about a different AI/ML topic."
+                        )
+                        st.session_state.active_answer = ""
+                    else:
+                        if hop_query:
+                            st.caption(f"Pass 2 concept: _{hop_query}_")
+
+                        all_matches = pass1 + pass2
+                        ctx = context_from_matches(all_matches)
+
+                        st.session_state.active_query   = query
+                        st.session_state.active_matches  = all_matches
+                        st.session_state.active_context  = ctx
+                        st.session_state.hop_query       = hop_query
+                        st.session_state.hop_matches     = pass2
+                        st.session_state.is_multihop     = True
+                        st.session_state.action_result   = ""
+                        st.session_state.action_label    = ""
+
+                        synth_prompt = build_answer_prompt(query, ctx)
+                        st.success("Answer synthesised from two retrieval passes:")
+                        streamed = st.write_stream(stream_gemini(synth_prompt))
+                        st.session_state.active_answer  = streamed or ""
+                        st.session_state.just_streamed  = True
+
+                        conf = avg_confidence(all_matches)
+                        st.session_state.query_history.append({
+                            "query":      query,
+                            "action":     "multihop",
+                            "confidence": conf,
+                            "timestamp":  datetime.datetime.now().isoformat(),
+                            "categories": _categories_from_matches(all_matches),
+                        })
                 else:
-                    ctx = context_from_matches(matches)
-                    with st.spinner("Reading papers and generating answer…"):
-                        answer = build_answer(query, ctx)
+                    # ── Standard single-pass path ────────────────────────────
+                    with st.spinner("Searching the vector database…"):
+                        matches = retrieve_documents(
+                            refined, category_filter=selected_categories
+                        )
 
-                    st.session_state.active_query   = query
-                    st.session_state.active_matches  = matches
-                    st.session_state.active_context  = ctx
-                    st.session_state.active_answer   = answer or ""
-                    st.session_state.action_result   = ""
-                    st.session_state.action_label    = ""
+                    if not matches:
+                        st.warning(
+                            "No relevant papers found. Try rephrasing, "
+                            "or ask about a different AI/ML topic."
+                        )
+                        st.session_state.active_answer = ""
+                    else:
+                        ctx = context_from_matches(matches)
 
-                    conf = avg_confidence(matches)
-                    st.session_state.query_history.append({
-                        "query":      query,
-                        "action":     action,
-                        "confidence": conf,
-                        "timestamp":  datetime.datetime.now().isoformat(),
-                        "categories": _categories_from_matches(matches),
-                    })
+                        st.session_state.active_query   = query
+                        st.session_state.active_matches  = matches
+                        st.session_state.active_context  = ctx
+                        st.session_state.hop_query       = ""
+                        st.session_state.hop_matches     = []
+                        st.session_state.is_multihop     = False
+                        st.session_state.action_result   = ""
+                        st.session_state.action_label    = ""
+
+                        st.success("Answer generated from research papers:")
+                        streamed = st.write_stream(
+                            stream_gemini(build_answer_prompt(query, ctx))
+                        )
+                        st.session_state.active_answer  = streamed or ""
+                        st.session_state.just_streamed  = True
+
+                        conf = avg_confidence(matches)
+                        st.session_state.query_history.append({
+                            "query":      query,
+                            "action":     action,
+                            "confidence": conf,
+                            "timestamp":  datetime.datetime.now().isoformat(),
+                            "categories": _categories_from_matches(matches),
+                        })
 
         # Display persisted answer + UI
         if st.session_state.active_answer:
@@ -662,8 +789,34 @@ Ask anything about AI/ML research. The assistant will:
                 st.markdown(f"**{label}**")
                 st.caption(desc)
 
-            st.success("Answer generated from research papers:")
-            st.markdown(f"### 💡 {st.session_state.active_answer}")
+            # On the same rerun that produced a streamed answer the answer was
+            # already rendered inline above; skip the duplicate display.
+            if st.session_state.get("just_streamed"):
+                st.session_state.just_streamed = False
+            else:
+                label_txt = (
+                    "Answer synthesised from two retrieval passes:"
+                    if st.session_state.get("is_multihop")
+                    else "Answer generated from research papers:"
+                )
+                st.success(label_txt)
+                st.markdown(f"### 💡 {st.session_state.active_answer}")
+
+            # ── Multi-hop reasoning trace ─────────────────────────────────────
+            if st.session_state.get("is_multihop") and st.session_state.get("hop_query"):
+                with st.expander("Multi-hop Reasoning Trace"):
+                    st.markdown(
+                        f"**Pass 1** retrieved papers matching your original query.\n\n"
+                        f"**Gemini identified a related concept:** _{st.session_state.hop_query}_\n\n"
+                        f"**Pass 2** retrieved **{len(st.session_state.hop_matches)}** additional "
+                        f"paper(s) on that concept. Both passes were combined for the final answer."
+                    )
+                    if st.session_state.hop_matches:
+                        st.markdown("**Pass 2 sources:**")
+                        for _hm in st.session_state.hop_matches:
+                            _ht = _hm["metadata"]["title"]
+                            _hu = _hm["metadata"].get("url", "")
+                            st.markdown(f"- [{_ht}]({_hu})" if _hu else f"- {_ht}")
 
             # ── Action buttons ────────────────────────────────────────────────
             st.markdown("---")

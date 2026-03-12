@@ -2,10 +2,14 @@ import os
 import re
 import requests
 import xml.etree.ElementTree as ET
+import nltk
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 from supabase import create_client
 from dotenv import load_dotenv
+
+# Download sentence tokenizer data on first run (no-op if already present).
+nltk.download('punkt_tab', quiet=True)
 
 _ATOM_NS  = {'atom': 'http://www.w3.org/2005/Atom'}
 _ARXIV_NS = 'http://arxiv.org/schemas/atom'
@@ -146,14 +150,27 @@ def process_and_load(papers):
         #    them silently.
         text = text.encode('utf-8', errors='ignore').decode('utf-8')
 
-        # B. Chunking (Split text into 500-char pieces with overlap)
-        chunk_size = 500
-        overlap = 50
-        chunks = []
-        for i in range(0, len(text), chunk_size - overlap):
-            chunk = text[i:i + chunk_size].strip()
-            if len(chunk) > 100:  # ignore tiny / whitespace-only chunks
-                chunks.append(chunk)
+        # B. Chunking — sentence-boundary chunks (target ≈ 800 chars, min 100 chars).
+        # Sentences are accumulated until the next sentence would exceed the target;
+        # the current buffer is then flushed as a chunk.  This keeps full sentences
+        # intact so the embedding model receives coherent semantic units rather than
+        # fragments mid-sentence.
+        TARGET_CHUNK = 800
+        MIN_CHUNK    = 100
+        sentences    = nltk.sent_tokenize(text)
+        chunks: list[str] = []
+        current = ""
+        for sent in sentences:
+            if not current:
+                current = sent
+            elif len(current) + 1 + len(sent) <= TARGET_CHUNK:
+                current += " " + sent
+            else:
+                if len(current) >= MIN_CHUNK:
+                    chunks.append(current)
+                current = sent
+        if current and len(current) >= MIN_CHUNK:
+            chunks.append(current)
 
         if not chunks:
             continue
