@@ -125,31 +125,29 @@ def retrieve_documents(
     count: int = 5,
     category_filter: list | None = None,
 ) -> list:
-    """
-    Cosine-similarity search with deduplication and paper-level diversity.
+    query_vector = embedding_model.encode(query).tolist()
 
-    Strategy (all from a single over-fetched batch):
-      1. Remove exact-content duplicates (repeated ETL runs can insert the
-         same chunk multiple times).
-      2. Pick the best-scoring chunk from each unique paper first, then fill
-         any remaining slots with the next-best chunks regardless of paper.
-    This ensures the context window spans multiple papers when they exist,
-    rather than returning N chunks from the single closest paper.
-
-    Optional category_filter post-filters results to selected categories.
-    """
     try:
-        query_vector = embedding_model.encode(query).tolist()
-        resp = supabase.rpc("match_documents", {
+        resp = supabase.rpc("hybrid_search", {
+            "query_text":      query,
             "query_embedding": query_vector,
+            "match_count":     count * 8,
             "match_threshold": threshold,
-            "match_count": count * 8,
+            "rrf_k":           60,
         }).execute()
-    except Exception as e:
-        st.error(f"Retrieval error: {e}")
-        return []
+    except Exception:
+        # Fallback to pure vector search if hybrid is unavailable
+        try:
+            resp = supabase.rpc("match_documents", {
+                "query_embedding": query_vector,
+                "match_threshold": threshold,
+                "match_count":     count * 8,
+            }).execute()
+        except Exception as e:
+            st.error(f"Retrieval error: {e}")
+            return []
 
-    # Step 1 — deduplicate by content fingerprint
+    # Deduplication — exact same logic as before
     seen_fp: set[str] = set()
     deduped: list     = []
     for doc in (resp.data or []):
@@ -158,7 +156,6 @@ def retrieve_documents(
             seen_fp.add(fp)
             deduped.append(doc)
 
-    # Step 2 — one best chunk per paper, then overflow chunks
     best_per_paper: dict[str, dict] = {}
     overflow:       list            = []
     for doc in deduped:
@@ -170,7 +167,6 @@ def retrieve_documents(
 
     result = (list(best_per_paper.values()) + overflow)[:count]
 
-    # Step 3 — optional category filter (post-retrieval)
     if category_filter and "All" not in category_filter:
         result = [
             m for m in result
@@ -178,7 +174,6 @@ def retrieve_documents(
         ]
 
     return result
-
 
 def build_answer(user_query: str, context_text: str) -> str | None:
     """Ask Gemini to synthesise a grounded answer from retrieved context."""
@@ -345,9 +340,9 @@ def render_source_paper(match: dict, key_prefix: str) -> None:
     st.divider()
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=3600)
 def fetch_trending_papers(days: int = 7) -> list:
-    """Fetch documents published within `days` days. Cached for 5 minutes."""
+    """Fetch documents published within `days` days. Cached for 1 hour."""
     try:
         cutoff = (
             datetime.datetime.utcnow() - datetime.timedelta(days=days)
@@ -591,7 +586,11 @@ Ask anything about AI/ML research. The assistant will:
     else:
         query = st.text_input(
             "Ask a question about AI/ML research:",
-            placeholder="e.g., How does multi-head attention work in Transformers?",
+            placeholder=(
+                "e.g., How does LoRA reduce fine-tuning cost?  ·  "
+                "What is RLHF and how is it used in LLMs?  ·  "
+                "Explain diffusion model denoising step by step"
+            ),
         )
 
         if st.button("Search", type="primary") and query:

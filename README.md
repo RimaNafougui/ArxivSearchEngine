@@ -11,6 +11,11 @@ pinned: true
 
 # ArXiv RAG Research Assistant
 
+![Papers Indexed](https://img.shields.io/badge/papers%20indexed-1%2C200%2B-blue)
+![Python](https://img.shields.io/badge/python-3.13-blue)
+![Streamlit](https://img.shields.io/badge/built%20with-Streamlit-ff4b4b)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 A **full-stack AI application** that turns the ArXiv research database into a conversational assistant. Ask a question about AI/ML research and the system retrieves the most relevant paper chunks, then uses **Google Gemini** to generate a grounded answer — no hallucination.
 
 ![App Demo](/images/demo.png)
