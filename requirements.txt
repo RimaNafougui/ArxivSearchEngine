@@ -80,6 +80,7 @@ rpds-py==0.30.0
 safetensors==0.7.0
 scikit-learn==1.8.0
 scipy==1.17.0
+sendgrid>=6.11.0
 sentence-transformers==5.2.2
 setuptools==80.10.2
 shellingham==1.5.4

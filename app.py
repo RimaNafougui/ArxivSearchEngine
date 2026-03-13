@@ -8,7 +8,12 @@ import json
 import re
 import datetime
 import pandas as pd
+import numpy as np
+import nltk
+from pypdf import PdfReader
 from dotenv import load_dotenv
+
+nltk.download('punkt_tab', quiet=True)
 
 # ── 1. SETUP ──────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -200,7 +205,8 @@ def build_answer_prompt(user_query: str, context_text: str) -> str:
         "and note what is missing.\n"
         "- Only reply \"I couldn't find relevant information in the retrieved papers.\" "
         "if the Context contains absolutely nothing related to the question.\n"
-        "- Never invent facts that are not supported by the Context.\n\n"
+        "- Never invent facts that are not supported by the Context.\n"
+        "- Respond in the same language as the Question.\n\n"
         f"Context:\n{context_text}\n\n"
         f"Question: {user_query}\n\nAnswer:"
     )
@@ -308,6 +314,119 @@ JSON:"""
             pass
 
     return "search_papers", {"refined_query": user_query}
+
+
+# ── FEEDBACK ──────────────────────────────────────────────────────────────────
+
+def submit_feedback(query: str, answer: str, rating: int) -> None:
+    """Write a thumbs-up (1) or thumbs-down (-1) rating to the feedback table."""
+    try:
+        supabase.table("feedback").insert({
+            "query":     query,
+            "answer":    answer[:1500],
+            "rating":    rating,
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+        }).execute()
+        st.toast("Thanks for the feedback!")
+    except Exception as e:
+        st.toast(f"Couldn't save feedback: {e}")
+
+
+# ── PDF UPLOAD ────────────────────────────────────────────────────────────────
+
+def process_uploaded_pdf(uploaded_file) -> list[dict]:
+    """Extract text from an uploaded PDF, chunk by sentence boundary, and embed.
+
+    Returns a list of {'content': str, 'embedding': list[float]} dicts stored
+    in session state — nothing is written to Supabase.
+    """
+    try:
+        reader = PdfReader(uploaded_file)
+        text = "".join(page.extract_text() or "" for page in reader.pages)
+    except Exception as e:
+        st.error(f"Could not read PDF: {e}")
+        return []
+
+    if not text.strip():
+        st.warning("No text could be extracted from this PDF.")
+        return []
+
+    # Same sanitisation as the ETL pipeline
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    text = text.encode('utf-8', errors='ignore').decode('utf-8')
+
+    TARGET_CHUNK, MIN_CHUNK = 800, 100
+    sentences = nltk.sent_tokenize(text)
+    chunks: list[str] = []
+    current = ""
+    for sent in sentences:
+        if not current:
+            current = sent
+        elif len(current) + 1 + len(sent) <= TARGET_CHUNK:
+            current += " " + sent
+        else:
+            if len(current) >= MIN_CHUNK:
+                chunks.append(current)
+            current = sent
+    if current and len(current) >= MIN_CHUNK:
+        chunks.append(current)
+
+    if not chunks:
+        st.warning("No usable text chunks found in the PDF.")
+        return []
+
+    vectors = embedding_model.encode(chunks)
+    return [{"content": c, "embedding": v.tolist()} for c, v in zip(chunks, vectors)]
+
+
+def search_pdf_chunks(query: str, chunks: list[dict], top_k: int = 5) -> list[dict]:
+    """Cosine-similarity search over in-memory PDF chunks."""
+    qvec = embedding_model.encode(query)
+    results = []
+    for chunk in chunks:
+        evec = np.array(chunk["embedding"])
+        denom = np.linalg.norm(qvec) * np.linalg.norm(evec)
+        sim = float(np.dot(qvec, evec) / denom) if denom > 0 else 0.0
+        results.append({**chunk, "similarity": sim})
+    results.sort(key=lambda x: x["similarity"], reverse=True)
+    return results[:top_k]
+
+
+# ── RECOMMENDATIONS ───────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=300)
+def recommend_papers(reading_list_titles: tuple, top_n: int = 8) -> list[dict]:
+    """Find papers similar to the reading list's embedding centroid.
+
+    reading_list_titles is passed as a tuple so Streamlit can hash it.
+    """
+    if not reading_list_titles:
+        return []
+
+    vecs = embedding_model.encode(list(reading_list_titles))
+    centroid = np.mean(vecs, axis=0)
+
+    try:
+        resp = supabase.rpc("match_documents", {
+            "query_embedding": centroid.tolist(),
+            "match_threshold": 0.3,
+            "match_count":     top_n * 4,
+        }).execute()
+    except Exception as e:
+        st.error(f"Recommendation error: {e}")
+        return []
+
+    saved = set(reading_list_titles)
+    seen:  set[str] = set()
+    recs:  list[dict] = []
+    for doc in (resp.data or []):
+        title = doc["metadata"]["title"]
+        if title not in saved and title not in seen:
+            seen.add(title)
+            recs.append(doc["metadata"])
+        if len(recs) >= top_n:
+            break
+    return recs
 
 
 def arxiv_abstract_url(pdf_url: str) -> str:
@@ -460,6 +579,55 @@ def fetch_all_papers() -> list[dict]:
     return sorted(papers, key=lambda p: p.get("published", ""), reverse=True)
 
 
+@st.cache_data(ttl=3600)
+def fetch_hero_stats() -> tuple[int, int]:
+    """Return (queries_this_month, total_ratings) for the hero section.
+
+    Paper count is intentionally omitted here — callers use len(fetch_all_papers())
+    so both share the same 5-minute cache and the expensive pagination runs once.
+    Both queries below are cheap COUNT(*) calls.
+    """
+    queries = 0
+    ratings = 0
+    try:
+        first = datetime.datetime.utcnow().replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        ).isoformat()
+        resp = (
+            supabase.table("query_log")
+            .select("id", count="exact")
+            .gte("timestamp", first)
+            .execute()
+        )
+        queries = resp.count or 0
+    except Exception:
+        pass
+    try:
+        resp = (
+            supabase.table("feedback")
+            .select("id", count="exact")
+            .execute()
+        )
+        ratings = resp.count or 0
+    except Exception:
+        pass
+    return queries, ratings
+
+
+def log_query() -> None:
+    """Append one row to query_log whenever a search produces an answer.
+
+    Failures are silently ignored — stats are informational and must never
+    surface errors to the user or break the answer flow.
+    """
+    try:
+        supabase.table("query_log").insert(
+            {"timestamp": datetime.datetime.utcnow().isoformat()}
+        ).execute()
+    except Exception:
+        pass
+
+
 # ── 4. SESSION STATE ──────────────────────────────────────────────────────────
 _defaults = {
     "reading_list":   [],    # list[dict] — paper metadata
@@ -481,8 +649,17 @@ _defaults = {
     "cmp_answer":     "",
     "cmp_matches1":   [],
     "cmp_matches2":   [],
+    # Tab 1 — feedback
+    "feedback_given": False,
     # Tab 3 — confirm clear
     "confirm_clear":  False,
+    # Tab 6 — PDF upload
+    "pdf_chunks":     [],
+    "pdf_name":       "",
+    "pdf_answer":     "",
+    "pdf_matches":    [],
+    "pdf_query":      "",
+    "pdf_streamed":   False,
 }
 for _k, _v in _defaults.items():
     if _k not in st.session_state:
@@ -559,16 +736,46 @@ with st.sidebar:
     else:
         st.caption("No queries yet.")
 
+    st.divider()
+
+    # Email Alert Subscriptions
+    with st.expander("Email Alerts"):
+        st.caption("Get a weekly digest of new papers matching your topics.")
+        _alert_email = st.text_input(
+            "Your email",
+            placeholder="you@example.com",
+            key="sidebar_alert_email",
+        )
+        _alert_topics_raw = st.text_input(
+            "Topics (comma-separated)",
+            placeholder="diffusion models, LoRA, RLHF",
+            key="sidebar_alert_topics",
+        )
+        if st.button("Save Alert", key="btn_save_alert"):
+            _topics = [t.strip() for t in _alert_topics_raw.split(",") if t.strip()]
+            if not _alert_email or not _topics:
+                st.warning("Please enter both an email and at least one topic.")
+            else:
+                try:
+                    supabase.table("paper_alerts").upsert(
+                        {"email": _alert_email, "topics": _topics},
+                        on_conflict="email",
+                    ).execute()
+                    st.success("Alert saved!")
+                except Exception as _ae:
+                    st.error(f"Could not save alert: {_ae}")
+
 
 # ── 7. MAIN TITLE & TABS ──────────────────────────────────────────────────────
 st.title("ArXiv RAG Research Assistant")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Ask a Question",
     "Trending This Week",
     "Reading List",
     "Papers Database",
     "Analytics",
+    "Upload PDF",
 ])
 
 
@@ -716,12 +923,14 @@ Ask anything about AI/ML research. The assistant will:
                         st.session_state.is_multihop     = True
                         st.session_state.action_result   = ""
                         st.session_state.action_label    = ""
+                        st.session_state.feedback_given  = False
 
                         synth_prompt = build_answer_prompt(query, ctx)
                         st.success("Answer synthesised from two retrieval passes:")
                         streamed = st.write_stream(stream_gemini(synth_prompt))
                         st.session_state.active_answer  = streamed or ""
                         st.session_state.just_streamed  = True
+                        log_query()
 
                         conf = avg_confidence(all_matches)
                         st.session_state.query_history.append({
@@ -755,6 +964,7 @@ Ask anything about AI/ML research. The assistant will:
                         st.session_state.is_multihop     = False
                         st.session_state.action_result   = ""
                         st.session_state.action_label    = ""
+                        st.session_state.feedback_given  = False
 
                         st.success("Answer generated from research papers:")
                         streamed = st.write_stream(
@@ -762,6 +972,7 @@ Ask anything about AI/ML research. The assistant will:
                         )
                         st.session_state.active_answer  = streamed or ""
                         st.session_state.just_streamed  = True
+                        log_query()
 
                         conf = avg_confidence(matches)
                         st.session_state.query_history.append({
@@ -874,6 +1085,31 @@ Ask anything about AI/ML research. The assistant will:
             if st.session_state.action_result:
                 st.markdown(f"#### {st.session_state.action_label}")
                 st.markdown(st.session_state.action_result)
+
+            # ── Answer quality feedback ───────────────────────────────────────
+            st.markdown("---")
+            st.caption("Was this answer helpful?")
+            _fb_cols = st.columns([1, 1, 8])
+            with _fb_cols[0]:
+                if st.button("👍", key="fb_up", disabled=st.session_state.feedback_given):
+                    submit_feedback(
+                        st.session_state.active_query,
+                        st.session_state.active_answer,
+                        1,
+                    )
+                    st.session_state.feedback_given = True
+                    st.rerun()
+            with _fb_cols[1]:
+                if st.button("👎", key="fb_down", disabled=st.session_state.feedback_given):
+                    submit_feedback(
+                        st.session_state.active_query,
+                        st.session_state.active_answer,
+                        -1,
+                    )
+                    st.session_state.feedback_given = True
+                    st.rerun()
+            if st.session_state.feedback_given:
+                st.caption("Feedback recorded — thank you!")
 
             # ── Top-3 sources in sidebar ──────────────────────────────────────
             with st.sidebar:
@@ -1025,6 +1261,57 @@ with tab3:
                     st.session_state.confirm_clear = False
                     st.rerun()
 
+    # ── Recommendations ───────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Recommended for You")
+
+    if len(st.session_state.reading_list) < 2:
+        st.info(
+            "Save at least 2 papers to your reading list and recommendations "
+            "will appear here based on what you've been reading."
+        )
+    else:
+        _rl_titles = tuple(
+            p.get("title", "") for p in st.session_state.reading_list if p.get("title")
+        )
+        with st.spinner("Finding similar papers…"):
+            _recs = recommend_papers(_rl_titles)
+
+        if not _recs:
+            st.caption("No new recommendations found right now.")
+        else:
+            st.caption(
+                f"Based on your {len(_rl_titles)} saved papers — "
+                f"centroid similarity search across the full database."
+            )
+            for _rec in _recs:
+                _rt   = _rec.get("title", "Unknown")
+                _ru   = _rec.get("url", "")
+                _rcat = _rec.get("category", "")
+                _rpub = _rec.get("published", "")[:10]
+                _rabs = arxiv_abstract_url(_ru) if _ru else ""
+
+                _rc1, _rc2 = st.columns([5, 1])
+                with _rc1:
+                    st.markdown(f"**{_rt}**")
+                    st.caption(f"{_rcat} · {_rpub}")
+                with _rc2:
+                    if st.button("Save", key=f"rec_{_rt[:20]}"):
+                        save_to_reading_list({
+                            "title":     _rt,
+                            "url":       _ru,
+                            "published": _rpub,
+                            "category":  _rcat,
+                        })
+                _links = []
+                if _rabs:
+                    _links.append(f"[Abstract ↗]({_rabs})")
+                if _ru:
+                    _links.append(f"[PDF ↗]({_ru})")
+                if _links:
+                    st.markdown(" · ".join(_links))
+                st.divider()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — Papers Database
@@ -1159,3 +1446,96 @@ with tab5:
         else:
             st.caption("(No category data yet — showing action breakdown instead.)")
             st.bar_chart(pd.DataFrame({"Queries": _action_cts}))
+
+        # Feedback summary
+        st.subheader("Answer Quality Ratings")
+        try:
+            _fb_resp = supabase.table("feedback").select("rating").execute()
+            _fb_data = _fb_resp.data or []
+            _up   = sum(1 for r in _fb_data if r.get("rating") == 1)
+            _down = sum(1 for r in _fb_data if r.get("rating") == -1)
+            if _fb_data:
+                _fa, _fb_col, _fc = st.columns(3)
+                _fa.metric("Total Ratings",  len(_fb_data))
+                _fb_col.metric("Thumbs Up",  _up)
+                _fc.metric("Thumbs Down",    _down)
+                st.bar_chart(pd.DataFrame({"Ratings": {"👍": _up, "👎": _down}}))
+            else:
+                st.caption("No ratings yet.")
+        except Exception:
+            st.caption("Feedback table not yet created. See supabase_migrations.sql.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — Upload PDF
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab6:
+    st.subheader("Ask Questions About Your Own PDF")
+    st.markdown(
+        "Upload any research paper (not just ArXiv) and ask questions about it. "
+        "The same sentence-boundary chunking and embedding pipeline is applied — "
+        "nothing is stored to the database."
+    )
+
+    _uploaded = st.file_uploader("Choose a PDF file", type="pdf")
+
+    if _uploaded is not None and _uploaded.name != st.session_state.pdf_name:
+        with st.spinner(f"Processing **{_uploaded.name}**…"):
+            _chunks = process_uploaded_pdf(_uploaded)
+        if _chunks:
+            st.session_state.pdf_chunks  = _chunks
+            st.session_state.pdf_name    = _uploaded.name
+            st.session_state.pdf_answer  = ""
+            st.session_state.pdf_matches = []
+            st.session_state.pdf_query   = ""
+            st.session_state.pdf_streamed = False
+            st.success(
+                f"Processed **{_uploaded.name}** into **{len(_chunks)} chunks**. "
+                "Ask a question below."
+            )
+
+    if st.session_state.pdf_chunks:
+        st.caption(
+            f"Active document: **{st.session_state.pdf_name}** "
+            f"({len(st.session_state.pdf_chunks)} chunks)"
+        )
+
+        _pdf_q = st.text_input(
+            "Ask a question about this PDF:",
+            placeholder="e.g., What method does this paper propose?",
+            key="pdf_question_input",
+        )
+
+        if st.button("Ask", type="primary", key="pdf_ask_btn") and _pdf_q:
+            with st.spinner("Searching PDF…"):
+                _pdf_hits = search_pdf_chunks(_pdf_q, st.session_state.pdf_chunks)
+
+            if not _pdf_hits:
+                st.warning("No relevant passages found in the PDF.")
+            else:
+                _pdf_ctx = "\n\n".join(
+                    f"[Chunk {i+1}]\n{h['content']}"
+                    for i, h in enumerate(_pdf_hits)
+                )
+                _pdf_prompt = build_answer_prompt(_pdf_q, _pdf_ctx)
+                st.success("Answer from your uploaded PDF:")
+                _pdf_streamed = st.write_stream(stream_gemini(_pdf_prompt))
+
+                st.session_state.pdf_query   = _pdf_q
+                st.session_state.pdf_matches = _pdf_hits
+                st.session_state.pdf_answer  = _pdf_streamed or ""
+                st.session_state.pdf_streamed = True
+
+        if st.session_state.pdf_answer and not st.session_state.pdf_streamed:
+            st.success("Answer from your uploaded PDF:")
+            st.markdown(f"### 💡 {st.session_state.pdf_answer}")
+        elif st.session_state.pdf_answer:
+            # Reset flag after first render to enable cached display on re-runs
+            st.session_state.pdf_streamed = False
+
+        if st.session_state.pdf_matches:
+            with st.expander("Source passages from PDF"):
+                for _pi, _pm in enumerate(st.session_state.pdf_matches):
+                    st.markdown(f"**Passage {_pi+1}** — similarity `{_pm['similarity']:.2f}`")
+                    st.info(_pm["content"][:400] + ("…" if len(_pm["content"]) > 400 else ""))
+                    st.divider()
