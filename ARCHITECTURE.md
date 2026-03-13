@@ -120,7 +120,7 @@ created_at  TIMESTAMPTZ DEFAULT now()
 
 ### 2.4 Scheduling
 
-The pipeline runs as a GitHub Actions workflow on a `cron: "0 0 * * 0"` schedule — every Sunday at 00:00 UTC.  `workflow_dispatch` allows an on-demand trigger for ad-hoc refreshes.
+The pipeline runs as a GitHub Actions workflow on a `cron: "0 2 * * *"` schedule — every day at 02:00 UTC.  `workflow_dispatch` allows an on-demand trigger for ad-hoc refreshes.
 
 **Secrets management:** API keys are stored in GitHub repository secrets and injected as environment variables at runtime.  They never appear in the committed codebase.
 
@@ -143,7 +143,7 @@ python etl_pipeline.py
 Supabase documents table updated
 ```
 
-**Why weekly?** ArXiv publishes new submissions daily, but the system's target query volume is low, so a weekly cadence balances freshness against compute cost.  A daily schedule could be adopted with no code changes — only the cron expression needs updating.
+**Why daily?** ArXiv publishes new submissions every day; a daily ingest at 02:00 UTC keeps the index fresh within ~24 hours of each new paper appearing.  The pipeline is fully idempotent — papers already in the database are skipped via URL-level deduplication, so re-running multiple times is safe and incurs no duplicate storage.
 
 ---
 

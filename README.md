@@ -50,7 +50,7 @@ Built to demonstrate production RAG patterns: streaming, multi-hop reasoning, ag
 | **Session Analytics** | Query history table, confidence chart, category usage, feedback summary metrics |
 | **Auto model discovery** | Probes Gemini models newest-first at startup; survives Google deprecations without code changes |
 | **Idempotent ETL** | Re-running the pipeline skips already-indexed papers; URL-level deduplication in the database |
-| **Weekly ETL automation** | GitHub Actions cron runs every Sunday and pushes new papers into the vector store |
+| **Daily ETL automation** | GitHub Actions cron runs every day at 02:00 UTC and pushes new papers into the vector store |
 
 ---
 
@@ -206,7 +206,7 @@ Add `SENDGRID_API_KEY` and `ALERT_FROM_EMAIL` to your GitHub repository secrets.
 ├── CONTRIBUTING.md                # Contribution guidelines
 ├── .github/
 │   └── workflows/
-│       ├── weekly_update.yml      # ETL cron — every Sunday 00:00 UTC
+│       ├── weekly_update.yml      # ETL cron — every day 02:00 UTC
 │       └── paper_alerts.yml       # Email alerts cron — every Monday 08:00 UTC
 └── downloads/                     # Cached PDFs (git-ignored)
 ```
