@@ -1437,11 +1437,23 @@ with tab4:
     with st.spinner("Loading papers…"):
         all_papers = fetch_all_papers()
 
-    _search_title = st.text_input(
-        "Search by title",
-        placeholder="e.g., transformer, diffusion, reinforcement…",
-    )
-    _year_min, _year_max = st.slider("Year range", 2018, 2025, (2020, 2025))
+    _col_search, _col_cat = st.columns([3, 2])
+    with _col_search:
+        _search_title = st.text_input(
+            "Search by title",
+            placeholder="e.g., transformer, diffusion, reinforcement…",
+        )
+    with _col_cat:
+        _DB_CATEGORIES = [
+            "All",
+            "cs.AI", "cs.LG", "cs.CL", "cs.CV",
+            "q-fin.ST", "q-fin.CP", "q-fin.PM", "q-fin.TR", "q-fin.RM", "q-fin.MF",
+        ]
+        _cat_filter: list = st.multiselect(
+            "Category", _DB_CATEGORIES, default=["All"], key="db_cat_filter"
+        ) or ["All"]
+
+    _year_min, _year_max = st.slider("Year range", 2018, 2026, (2020, 2026))
 
     # Apply title search
     _filtered = (
@@ -1456,11 +1468,11 @@ with tab4:
         if _year_min <= int(p.get("published", "0000")[:4] or "0") <= _year_max
     ]
 
-    # Apply category filter (uses sidebar selection)
-    if "All" not in selected_categories:
+    # Apply inline category filter
+    if "All" not in _cat_filter:
         _filtered = [
             p for p in _filtered
-            if p.get("category", "") in selected_categories
+            if p.get("category", "") in _cat_filter
         ]
 
     st.caption(f"Showing **{len(_filtered)}** of **{len(all_papers)}** papers")
