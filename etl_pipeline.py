@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import requests
 import xml.etree.ElementTree as ET
 import nltk
@@ -24,6 +25,28 @@ supabase = create_client(url, key)
 print("Loading AI Model...")
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
+def _get_with_retry(url, timeout=90, max_retries=3):
+    """GET with exponential backoff on timeout or server errors."""
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, timeout=timeout)
+            response.raise_for_status()
+            return response.content
+        except (requests.exceptions.Timeout, requests.exceptions.ReadTimeout):
+            wait = 2 ** attempt * 5  # 5s, 10s, 20s
+            print(f"Request timed out (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
+            if attempt < max_retries - 1:
+                time.sleep(wait)
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 503 and attempt < max_retries - 1:
+                wait = 2 ** attempt * 5
+                print(f"ArXiv returned 503 (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
+    raise requests.exceptions.RetryError(f"All {max_retries} attempts failed for {url}")
+
+
 def extract_papers(
     search_query: str = (
         "cat:cs.AI OR cat:cs.LG OR cat:cs.CL OR cat:cs.CV"
@@ -46,16 +69,15 @@ def extract_papers(
         f'&sortBy=submittedDate'
         f'&sortOrder=descending'
     )
-    # ArXiv requests large result sets in pages to avoid malformed responses.
-    data = requests.get(api_url, timeout=30).content
+    data = _get_with_retry(api_url)
 
     # Parse XML response
     try:
         root = ET.fromstring(data)
     except ET.ParseError:
         print("Warning: ArXiv returned malformed XML — retrying with smaller batch...")
-        fallback_url = api_url.replace(f'max_results={max_results}', 'max_results=100')
-        data = requests.get(fallback_url, timeout=30).content
+        fallback_url = api_url.replace(f'max_results={max_results}', 'max_results=50')
+        data = _get_with_retry(fallback_url)
         root = ET.fromstring(data)
 
     # Create a 'downloads' folder if it doesn't exist
@@ -92,9 +114,9 @@ def extract_papers(
         # Download the actual PDF (file-level deduplication)
         if not os.path.exists(filename):
             print(f"Downloading: {title}...")
-            response = requests.get(link)
+            pdf_data = _get_with_retry(link, timeout=120)
             with open(filename, 'wb') as f:
-                f.write(response.content)
+                f.write(pdf_data)
         else:
             print(f"Skipping download (exists): {title}")
 
