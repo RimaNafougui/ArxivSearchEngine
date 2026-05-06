@@ -16,15 +16,7 @@ filelock==3.20.3
 fsspec==2026.1.0
 gitdb==4.0.12
 GitPython==3.1.46
-google-ai-generativelanguage==0.6.15
-google-api-core==2.29.0
-google-api-python-client==2.188.0
-google-auth==2.49.0.dev0
-google-auth-httplib2==0.3.0
-google-genai>=1.0.0
-googleapis-common-protos==1.72.0
-grpcio==1.76.0
-grpcio-status==1.71.2
+openai>=1.0.0
 h11==0.16.0
 h2==4.3.0
 hf-xet==1.2.0

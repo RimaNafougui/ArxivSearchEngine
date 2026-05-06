@@ -1,8 +1,7 @@
 import streamlit as st
 from sentence_transformers import SentenceTransformer
 from supabase import create_client
-from google import genai
-from google.genai import types
+from openai import OpenAI
 import os
 import json
 import re
@@ -19,22 +18,12 @@ nltk.download('punkt_tab', quiet=True)
 load_dotenv()
 supabase_url = os.environ.get("SUPABASE_URL")
 supabase_key  = os.environ.get("SUPABASE_KEY")
-google_key    = os.environ.get("GOOGLE_API_KEY")
+openai_key    = os.environ.get("OPENAI_API_KEY")
 
 supabase = create_client(supabase_url, supabase_key)
-gemini   = genai.Client(api_key=google_key)
+client   = OpenAI(api_key=openai_key)
 
-# Candidates tried newest-first.  The first one that accepts a live
-# generation call (not just appears in models.list) is used.
-_MODEL_CANDIDATES = [
-    "gemini-2.5-flash",
-    "gemini-2.5-pro",
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash-exp",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash-latest",
-]
+OPENAI_MODEL = "gpt-4o-mini"
 
 # ── 2. CACHED RESOURCES ───────────────────────────────────────────────────────
 @st.cache_resource
@@ -42,31 +31,7 @@ def load_embedding_model():
     return SentenceTransformer('all-MiniLM-L6-v2')
 
 
-@st.cache_resource
-def discover_gemini_model() -> str:
-    """
-    Return the first model in _MODEL_CANDIDATES that actually accepts a
-    generation call for this API key.
-
-    models.list() is intentionally skipped: deprecated models still appear
-    in the list but return 404 on generate_content.  A cheap 1-token probe
-    is the only reliable test.  Result is cached for the app's lifetime.
-    """
-    for name in _MODEL_CANDIDATES:
-        try:
-            gemini.models.generate_content(
-                model=name,
-                contents="hi",
-                config=types.GenerateContentConfig(max_output_tokens=1),
-            )
-            return name
-        except Exception:
-            continue
-    return _MODEL_CANDIDATES[-1]
-
-
 embedding_model = load_embedding_model()
-GEMINI_MODEL    = discover_gemini_model()
 
 
 # ── 3. HELPER FUNCTIONS ───────────────────────────────────────────────────────
@@ -81,29 +46,29 @@ def student_suffix() -> str:
     return ""
 
 
-def call_gemini(prompt: str) -> str | None:
-    """Single reusable Gemini call. Surfaces errors with st.error()."""
+def call_openai(prompt: str) -> str | None:
+    """Single reusable OpenAI call. Surfaces errors with st.error()."""
     try:
-        return gemini.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        ).text
+        return client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+        ).choices[0].message.content
     except Exception as e:
-        st.error(f"Gemini error: {e}")
+        st.error(f"OpenAI error: {e}")
         return None
 
 
-def stream_gemini(prompt: str):
-    """Yields text chunks from a streaming Gemini call for use with st.write_stream()."""
+def stream_openai(prompt: str):
+    """Yields text chunks from a streaming OpenAI call for use with st.write_stream()."""
     try:
-        for chunk in gemini.models.generate_content_stream(
-            model=GEMINI_MODEL,
-            contents=prompt,
+        for chunk in client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            stream=True,
         ):
-            if chunk.text:
-                yield chunk.text
+            yield chunk.choices[0].delta.content or ""
     except Exception as e:
-        st.error(f"Gemini streaming error: {e}")
+        st.error(f"OpenAI streaming error: {e}")
 
 
 def _bibtex_slug(title: str, year: str) -> str:
@@ -214,7 +179,7 @@ def build_answer_prompt(user_query: str, context_text: str) -> str:
 
 def build_answer(user_query: str, context_text: str) -> str | None:
     """Ask Gemini to synthesise a grounded answer from retrieved context."""
-    return call_gemini(build_answer_prompt(user_query, context_text))
+    return call_openai(build_answer_prompt(user_query, context_text))
 
 
 def multihop_retrieve(
@@ -246,7 +211,7 @@ def multihop_retrieve(
         f"Context (first-pass results):\n{ctx1[:2000]}\n\n"
         "Related search query:"
     )
-    hop_query = call_gemini(concept_prompt)
+    hop_query = call_openai(concept_prompt)
     if not hop_query:
         return pass1, [], ""
 
@@ -296,10 +261,10 @@ User query: "{user_query}"
 JSON:"""
 
     try:
-        raw = gemini.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=routing_prompt,
-        ).text
+        raw = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": routing_prompt}],
+        ).choices[0].message.content
     except Exception:
         return "search_papers", {"refined_query": user_query}
 
@@ -694,7 +659,7 @@ st.markdown(
 # ── 6. SIDEBAR ────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("ArXiv RAG")
-    st.caption(f"Model: `{GEMINI_MODEL}`")
+    st.caption(f"Model: `{OPENAI_MODEL}`")
     st.divider()
 
     # Student Mode toggle
@@ -943,7 +908,7 @@ Ask anything about AI/ML research. The assistant will:
                     "Comparison:"
                 )
                 with st.spinner("Generating comparison…"):
-                    cmp_ans = call_gemini(cmp_prompt)
+                    cmp_ans = call_openai(cmp_prompt)
 
                 st.session_state.cmp_answer   = cmp_ans or ""
                 st.session_state.cmp_matches1 = m1
@@ -1042,7 +1007,7 @@ Ask anything about AI/ML research. The assistant will:
 
                         synth_prompt = build_answer_prompt(query, ctx)
                         st.success("Answer synthesised from two retrieval passes:")
-                        streamed = st.write_stream(stream_gemini(synth_prompt))
+                        streamed = st.write_stream(stream_openai(synth_prompt))
                         st.session_state.active_answer  = streamed or ""
                         st.session_state.just_streamed  = True
                         log_query()
@@ -1083,7 +1048,7 @@ Ask anything about AI/ML research. The assistant will:
 
                         st.success("Answer generated from research papers:")
                         streamed = st.write_stream(
-                            stream_gemini(build_answer_prompt(query, ctx))
+                            stream_openai(build_answer_prompt(query, ctx))
                         )
                         st.session_state.active_answer  = streamed or ""
                         st.session_state.just_streamed  = True
@@ -1153,7 +1118,7 @@ Ask anything about AI/ML research. The assistant will:
             with b1:
                 if st.button("Summarize in 3 bullets"):
                     with st.spinner("Summarizing…"):
-                        res = call_gemini(
+                        res = call_openai(
                             f"Summarize the following research context in exactly "
                             f"3 concise bullet points.{student_suffix()}"
                             f"\n\nContext:\n{_ctx}\n\nBullet summary:"
@@ -1164,7 +1129,7 @@ Ask anything about AI/ML research. The assistant will:
             with b2:
                 if st.button("Find open problems"):
                     with st.spinner("Identifying open problems…"):
-                        res = call_gemini(
+                        res = call_openai(
                             "Based on the following research papers, what are the main "
                             f"unsolved problems and open challenges identified?{student_suffix()}"
                             f"\n\nContext:\n{_ctx}\n\nOpen problems:"
@@ -1176,7 +1141,7 @@ Ask anything about AI/ML research. The assistant will:
                 # Always uses student-mode phrasing regardless of toggle
                 if st.button("Explain for students"):
                     with st.spinner("Simplifying…"):
-                        res = call_gemini(
+                        res = call_openai(
                             "Explain the following research in simple terms for an "
                             "undergraduate student with no prior background.\n\n"
                             f"Context:\n{_ctx}\n\n"
@@ -1188,7 +1153,7 @@ Ask anything about AI/ML research. The assistant will:
             with b4:
                 if st.button("Related concepts"):
                     with st.spinner("Finding related concepts…"):
-                        res = call_gemini(
+                        res = call_openai(
                             "Based on the following research papers, what adjacent "
                             "topics, related concepts, and further reading areas do "
                             f"these papers point toward?{student_suffix()}"
@@ -1321,7 +1286,7 @@ with tab2:
                 f"Papers:\n{_titles_txt}\n\nDigest:"
             )
             with st.spinner("Writing digest…"):
-                _digest = call_gemini(_digest_prompt)
+                _digest = call_openai(_digest_prompt)
             if _digest:
                 st.markdown(_digest)
 
@@ -1646,7 +1611,7 @@ with tab6:
                 )
                 _pdf_prompt = build_answer_prompt(_pdf_q, _pdf_ctx)
                 st.success("Answer from your uploaded PDF:")
-                _pdf_streamed = st.write_stream(stream_gemini(_pdf_prompt))
+                _pdf_streamed = st.write_stream(stream_openai(_pdf_prompt))
 
                 st.session_state.pdf_query   = _pdf_q
                 st.session_state.pdf_matches = _pdf_hits
