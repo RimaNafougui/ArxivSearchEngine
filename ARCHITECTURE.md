@@ -29,17 +29,17 @@ The system is composed of five loosely coupled layers:
 ┌──────────────────────┐
 │   1. ETL Pipeline    │  ArXiv API → PDF → chunk → embed → store
 └──────────┬───────────┘
-           │ (weekly batch)
+           │ (daily batch)
 ┌──────────▼───────────┐
 │  2. Vector Store     │  Supabase PostgreSQL + pgvector
 └──────────┬───────────┘
            │ (cosine search at query time)
 ┌──────────▼───────────┐
-│  3. Agentic Router   │  Gemini function-calling — route / clarify / decline
+│  3. Agentic Router   │  OpenAI function-calling (gpt-4o-mini) — route / clarify / decline
 └──────────┬───────────┘
            │
 ┌──────────▼───────────┐
-│  4. RAG Generator    │  Context prompt → Gemini 1.5 Flash → grounded answer
+│  4. RAG Generator    │  Context prompt → OpenAI gpt-4o-mini → grounded answer
 └──────────┬───────────┘
            │
 ┌──────────▼───────────┐
@@ -48,6 +48,8 @@ The system is composed of five loosely coupled layers:
 ```
 
 **Key design principle:** the language model only ever _synthesises_ information that the retrieval layer has already located.  It never generates facts from parametric memory.
+
+> **Note:** this document describes the Streamlit app (`app.py`), which runs on OpenAI `gpt-4o-mini` (migrated from Gemini). The optional FastAPI layer (`api.py`, §10) is a separate entry point that still runs on Gemini and has not been migrated — see §10 for details on that discrepancy.
 
 ---
 
@@ -279,7 +281,7 @@ User query (natural language)
              │
              ▼
 ┌────────────────────────┐
-│  Gemini 1.5 Flash      │  generates answer constrained to context
+│  OpenAI gpt-4o-mini    │  generates answer constrained to context
 └────────────┬───────────┘
              │
              ▼
@@ -338,7 +340,7 @@ User query
 [Pass 1 Retrieval]  — standard vector/hybrid search
      │
      ▼
-[Concept Extraction]  — Gemini reads Pass-1 context, returns one related
+[Concept Extraction]  — gpt-4o-mini reads Pass-1 context, returns one related
                         search query not yet covered (e.g. "sparse attention
                         linear complexity transformers")
      │
@@ -347,7 +349,7 @@ User query
                        papers already in Pass 1 are de-duplicated out
      │
      ▼
-[Synthesis]  — both contexts concatenated; Gemini generates a single
+[Synthesis]  — both contexts concatenated; gpt-4o-mini generates a single
                 grounded answer that reasons across both passes
 ```
 
@@ -361,13 +363,13 @@ with 2× the document limit in empirical testing on out-of-distribution question
 
 ### Streaming
 
-All Gemini generation calls in the main answer path use
-`generate_content_stream`, which yields text tokens as they are produced.
-Streamlit's `st.write_stream()` consumes the generator and renders characters
-incrementally, eliminating the 3–4 s blank-screen wait users experienced with
-the blocking `generate_content` call.  Action-button prompts (summarise,
-open problems, etc.) retain the blocking path because their output is shown
-in a separate container that appears only on demand.
+The main answer path uses OpenAI's streaming chat completions API
+(`stream=True`, wrapped by `stream_openai()`), which yields text chunks as
+they are produced.  Streamlit's `st.write_stream()` consumes the generator
+and renders characters incrementally, eliminating the 3–4 s blank-screen wait
+users experienced with the blocking `call_openai()` request.  Action-button
+prompts (summarise, open problems, etc.) retain the blocking path because
+their output is shown in a separate container that appears only on demand.
 
 ---
 
@@ -381,32 +383,29 @@ Version 2.0 introduces a lightweight agent that decides _what to do_ before doin
 User submits query
         │
         ▼
-Gemini 1.5 Flash (router)
-  tools: [search_papers, ask_clarification, report_no_results]
+gpt-4o-mini (router)  — run_agent(), structured JSON prompt
         │
-        ├─ function_call: search_papers(refined_query)
+        ├─ {"action":"search",     "query":"…"}
         │         │
-        │         ▼  pgvector search + Gemini generation
+        │         ▼  pgvector/hybrid search + gpt-4o-mini generation
         │         └─ answer + sources + confidence
         │
-        ├─ function_call: ask_clarification(question)
+        ├─ {"action":"clarify",    "question":"…"}
         │         │
         │         ▼  display question to user, await re-submission
         │
-        └─ function_call: report_no_results(explanation)
+        └─ {"action":"no_results", "reason":"…"}
                   │
                   ▼  display scope explanation, no search performed
 ```
 
-### 6.2 Why function calling, not a text-based classifier?
+### 6.2 Why a JSON prompt, not native function calling?
 
-Gemini's native function-calling API returns a **structured JSON object** (function name + typed arguments) rather than freeform text.  This removes the need for a regex or secondary parsing step and guarantees that the routing decision is machine-readable regardless of how the model phrases it internally.
-
-The three tool definitions are Python functions whose **docstrings serve as the schema descriptions** — the SDK extracts them automatically.  This co-locates documentation and behaviour in a single place.
+`run_agent()` asks `gpt-4o-mini` to respond with **exactly one JSON object** (`{"action": "search"|"clarify"|"no_results", ...}`) via a plain chat completion, rather than using OpenAI's native tool/function-calling API. The response is extracted with a regex (`\{[^{}]+\}`) and parsed with `json.loads`. This is a deliberate simplification made during the OpenAI migration (the app previously used Gemini's native function-calling, which returned a structured call object directly) — it keeps the router as a single `call_openai()` call with no separate tool-schema wiring, at the cost of an extra parsing step and a slightly higher (though in practice negligible) chance of malformed output.
 
 ### 6.3 Fallback behaviour
 
-If Gemini does not emit a function call (e.g. the model returns a plain text explanation), the agent loop defaults to `search_papers` with the original query.  This ensures the user always receives a response even if the router behaves unexpectedly.
+If the response contains no valid JSON object, or parsing fails (`json.JSONDecodeError` / missing keys), `run_agent()` defaults to `search_papers` with the original query. This ensures the user always receives a response even if the router's output is malformed.
 
 ---
 
@@ -475,10 +474,10 @@ Fixed-size character chunking works well at small scale but degrades at scale be
 
 | Concern                  | Current                           | At scale                                              |
 |--------------------------|-----------------------------------|-------------------------------------------------------|
-| Context length           | 5 chunks × ~500 chars ≈ 1.5 K tok | May need 10–20 chunks; use `gemini-1.5-pro` (1 M ctx) |
-| Latency                  | 1–3 s (acceptable)                | Add streaming (`generate_content(stream=True)`)       |
-| Cost                     | Low (Flash tier)                  | Cache repeated queries with Redis (TTL 1 hour)        |
-| Rate limits              | Free tier (15 RPM)                | Upgrade to paid tier; add request queue               |
+| Context length           | 5 chunks × ~500 chars ≈ 1.5 K tok | May need 10–20 chunks; use a larger-context model (e.g. `gpt-4.1` / `gpt-4o`) |
+| Latency                  | 1–3 s (acceptable)                | Already streamed (`stream=True` chat completions)     |
+| Cost                     | Low (`gpt-4o-mini` pricing)        | Cache repeated queries with Redis (TTL 1 hour)        |
+| Rate limits              | Standard OpenAI tier              | Upgrade tier; add request queue                       |
 
 ### 7.6 Infrastructure summary for 1 M documents
 
@@ -495,7 +494,7 @@ Fixed-size character chunking works well at small scale but degrades at scale be
 │  Serving                                                              │
 │  Query ──► Embedding API ──► pgvector (HNSW) ──► Redis cache         │
 │                                         │                             │
-│                              Gemini 1.5 Pro (streaming)               │
+│                              OpenAI gpt-4o / gpt-4.1 (streaming)      │
 │                                         │                             │
 │                              Streamlit / FastAPI frontend             │
 └───────────────────────────────────────────────────────────────────────┘
@@ -508,11 +507,11 @@ Fixed-size character chunking works well at small scale but degrades at scale be
 | Topic                   | Current state                              | Recommended improvement                            |
 |-------------------------|--------------------------------------------|----------------------------------------------------|
 | API keys                | Stored in `.env` (should not be committed) | Use GitHub Secrets; rotate quarterly               |
-| Supabase key type       | Service-role key (full access)             | Create a read-only API key for the web app         |
-| Row-Level Security      | Not enabled                                | Enable RLS; policy: allow `SELECT` only            |
+| Supabase key type       | Service-role key (full access), used by `app.py` and `send_alerts.py` | RLS (below) is defense-in-depth for the anon key path; switching the app itself to a scoped key is a separate follow-up — see `supabase_migrations.sql` |
+| Row-Level Security      | **Enabled** (`supabase_migrations.sql`) — `documents` public SELECT; `feedback`/`query_log` public SELECT+INSERT; `paper_alerts` INSERT+UPDATE only, no SELECT (protects subscriber emails) | Switch `app.py`/`send_alerts.py` off the service-role key onto a key these policies actually govern, for real defense-in-depth |
 | Google API key          | No domain or IP restrictions               | Restrict to specific referrer / service account    |
-| Input sanitisation      | None — query passed to embedding only      | Limit query length; strip control characters       |
-| Rate limiting           | None                                       | Add `st.session_state` counter or upstream WAF     |
+| Input sanitisation      | Query length capped at 2,000 chars (`_check_query_allowed` in `app.py`) | Consider stripping control characters too |
+| Rate limiting           | Per-session sliding window — 20 questions / 10 min, via `st.session_state` (`_check_query_allowed` in `app.py`) | Not a substitute for server-side/WAF rate limiting behind a shared deployment |
 
 ---
 
@@ -536,6 +535,8 @@ Adding these categories required no changes to the vector schema, chunking pipel
 ## 10. REST API (FastAPI)
 
 `api.py` wraps the retrieval and generation logic in a standard HTTP API, making the system consumable from any client without the Streamlit runtime.
+
+> **Backend discrepancy:** `api.py` still runs on Google Gemini (`google-genai` SDK, model auto-discovered at startup via the `lifespan` handler — see `_MODEL_CANDIDATES`) and requires `GOOGLE_API_KEY`. It was **not** part of the OpenAI migration described in §5–§6, which covers `app.py` only. The two entry points currently have independent LLM configuration; unifying them behind one provider (most likely OpenAI, to match `app.py`) is open follow-up work, not yet scheduled.
 
 ### Endpoints
 
@@ -629,7 +630,7 @@ This section records the key tradeoffs made during design. The goal is not to ju
 
 ### Why `all-MiniLM-L6-v2` over a larger or hosted embedding model
 
-The model runs entirely on CPU, including on the free GitHub Actions `ubuntu-latest` runner that executes the weekly ETL pipeline. Switching to OpenAI `text-embedding-3-small` would introduce a per-token API cost at every ingest run, require an additional secret in CI, and add latency for each chunk. On MTEB's Semantic Textual Similarity benchmark, MiniLM-L6 reaches Spearman ρ = 68.1 — within four points of the best public models — while encoding at roughly 9,000 sentences per second on a single CPU core. For a corpus under 100K chunks that is more than adequate. The more important constraint is consistency: if the ingest pipeline and the live query path use different models, vectors land in shifted semantic spaces and retrieval degrades silently. Using one model for both sides — loaded once per process via `@st.cache_resource` — eliminates that class of bug entirely. `all-mpnet-base-v2` (768-dim) would improve recall by a few points and is the natural upgrade when GPU becomes available for ingest; hosted APIs are appropriate only if embedding throughput becomes the pipeline bottleneck.
+The model runs entirely on CPU, including on the free GitHub Actions `ubuntu-latest` runner that executes the daily ETL pipeline. Switching to OpenAI `text-embedding-3-small` would introduce a per-token API cost at every ingest run, require an additional secret in CI, and add latency for each chunk. On MTEB's Semantic Textual Similarity benchmark, MiniLM-L6 reaches Spearman ρ = 68.1 — within four points of the best public models — while encoding at roughly 9,000 sentences per second on a single CPU core. For a corpus under 100K chunks that is more than adequate. The more important constraint is consistency: if the ingest pipeline and the live query path use different models, vectors land in shifted semantic spaces and retrieval degrades silently. Using one model for both sides — loaded once per process via `@st.cache_resource` — eliminates that class of bug entirely. `all-mpnet-base-v2` (768-dim) would improve recall by a few points and is the natural upgrade when GPU becomes available for ingest; hosted APIs are appropriate only if embedding throughput becomes the pipeline bottleneck.
 
 ### Why pgvector + Supabase over Pinecone, Weaviate, or Qdrant
 
@@ -639,9 +640,9 @@ Dedicated vector databases optimise for one operation: approximate nearest-neigh
 
 A FastAPI backend with a React or Next.js frontend is the right architecture for a production system with multiple engineers, a separate design function, and strict latency SLAs. For a solo portfolio project, the tradeoffs invert. `@st.cache_resource` handles model loading and prevents the embedding model from being re-instantiated on every request — one decorator replaces a Redis layer. `@st.cache_data` caches Supabase responses with a TTL — one decorator replaces an application-level query cache. `st.write_stream` adds streaming token-by-token output without WebSocket plumbing or server-sent event handlers. Tabs, sidebars, metrics, progress bars, and file uploaders come without writing a line of CSS or JavaScript. The architectural cost is real: Streamlit's execution model reruns the entire script on every widget interaction, which means stateful flows must be managed explicitly via `st.session_state`. That constraint shaped several design choices in this codebase — the `just_streamed` flag, the `feedback_given` flag, and the separation of "search triggers computation" from "display reads from state". Both patterns are documented inline. The migration path to FastAPI is straightforward: the retrieval and generation functions are already pure Python with no Streamlit coupling, and can be extracted into API route handlers without modification.
 
-### Why Google Gemini over OpenAI GPT-4o or Anthropic Claude
+### Why OpenAI `gpt-4o-mini` (migrated from Google Gemini)
 
-Gemini 1.5 Flash offers a one-million token context window on the free tier — the single most practically useful property for a RAG system, because it allows retrieving significantly more paper chunks before hitting context limits. The `generate_content_stream` API makes streaming a one-line change from the blocking path, which is why both are available in this codebase (`call_gemini` for synchronous action buttons, `stream_gemini` for the main answer path). The model auto-discovery mechanism (`discover_gemini_model`) probes candidates newest-first at startup: the application automatically begins using newer Gemini models as they ship without any code change. The principal tradeoff is vendor lock-in — the `google.genai` types and error surface are Google-specific. The mitigation is that `call_gemini` and `stream_gemini` are the only two call sites; wrapping them in a thin provider adapter would make swapping to OpenAI or Claude a one-afternoon task. That abstraction has not been built because the cost of the current coupling is low and premature abstraction is its own form of technical debt.
+The application originally ran on Gemini 1.5 Flash, chosen for its free-tier one-million-token context window and a startup-time model-discovery routine that probed candidate model names newest-first so the app kept working automatically through Google's model deprecations. That reasoning held as long as `call_gemini`/`stream_gemini` were the only two call sites — the prediction at the time was that swapping providers would be "a one-afternoon task." The app has since been migrated to OpenAI `gpt-4o-mini` (`call_openai`/`stream_openai` in `app.py`), and that prediction mostly held: the two call sites made the swap contained, though the agentic router (§6) was simplified from Gemini's native function-calling to a plain JSON-prompt-and-regex-parse pattern in the process, since `run_agent()` uses a single chat completion rather than OpenAI's tool-calling API. The model is now pinned to `gpt-4o-mini` rather than auto-discovered — a deliberate tradeoff of the auto-upgrade convenience for predictable cost and behavior, since silently switching models on every deploy is not something you generally want from a paid API tier the way it was on Gemini's free tier. The main outstanding gap is that `api.py` (§10) was not part of this migration and still runs on Gemini with its own auto-discovery logic, so the codebase currently has two LLM backends.
 
 ---
 

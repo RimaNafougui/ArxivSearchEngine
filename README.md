@@ -16,9 +16,9 @@ pinned: true
 ![Streamlit](https://img.shields.io/badge/built%20with-Streamlit-ff4b4b)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-A **full-stack AI application** that turns the ArXiv research database into a conversational assistant. Ask a question about AI/ML or quantitative finance research and the system retrieves the most relevant paper chunks using **hybrid search**, then uses **Google Gemini** to generate a grounded, streamed answer — no hallucination.
+A **full-stack AI application** that turns the ArXiv research database into a conversational assistant. Ask a question about AI/ML or quantitative finance research and the system retrieves the most relevant paper chunks using **hybrid search**, then uses **OpenAI's `gpt-4o-mini`** to generate a grounded, streamed answer — no hallucination.
 
-![App Demo](/images/demo.png)
+> The Streamlit app (`app.py`) runs on OpenAI. A separate optional REST API (`api.py`, see below) still runs on Google Gemini and has not yet been migrated — the two entry points currently use different LLM backends.
 
 ---
 
@@ -26,27 +26,27 @@ A **full-stack AI application** that turns the ArXiv research database into a co
 
 | Feature                    | Description                                                                                                              |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| **Agentic routing**        | Gemini decides whether to search, ask for clarification, or decline out-of-scope queries — before touching the database  |
+| **Agentic routing**        | `gpt-4o-mini` decides whether to search, ask for clarification, or decline out-of-scope queries — before touching the database |
 | **Hybrid search**          | Queries are matched via a `hybrid_search` RPC combining pgvector cosine similarity with full-text search (RRF fusion)   |
 | **RAG generation**         | Top retrieved chunks are assembled into a grounded prompt; the LLM can only answer from what the papers say             |
-| **Streaming answers**      | Responses are streamed token-by-token via `generate_content_stream` for a real-time feel                                |
-| **Multi-hop reasoning**    | Two-pass retrieval: Gemini extracts a related concept from pass-1 results and runs a second retrieval to deepen coverage |
+| **Streaming answers**      | Responses are streamed token-by-token via the OpenAI streaming chat completions API for a real-time feel                |
+| **Multi-hop reasoning**    | Two-pass retrieval: `gpt-4o-mini` extracts a related concept from pass-1 results and runs a second retrieval to deepen coverage |
 | **Confidence indicator**   | Cosine similarity scores drive a High/Medium/Low confidence label shown with every answer                               |
-| **Comparison mode**        | Run two queries side-by-side; Gemini contrasts what the papers say about each topic                                     |
+| **Comparison mode**        | Run two queries side-by-side; `gpt-4o-mini` contrasts what the papers say about each topic                              |
 | **Action buttons**         | After any answer: summarise in 3 bullets, find open problems, explain for students, or explore related concepts         |
-| **Student Mode**           | Sidebar toggle that appends an undergraduate-friendly explanation request to every Gemini prompt                        |
+| **Student Mode**           | Sidebar toggle that appends an undergraduate-friendly explanation request to every LLM prompt                          |
 | **Category filter**        | Filter retrieval and the Papers Database by `cs.AI / cs.LG / cs.CL / cs.CV` or q-fin categories                        |
 | **PDF upload**             | Upload any PDF for in-memory Q&A — sentence-chunked and embedded the same way as indexed papers                         |
 | **Reading List**           | Save papers with one click; export all as BibTeX or clear with confirmation                                             |
 | **Paper recommendations**  | Reading list centroid embedding → `match_documents` RPC surfaces similar unsaved papers                                 |
 | **BibTeX export**          | Per-paper and bulk BibTeX generation (`@misc{arxiv_YEAR_slug}` format)                                                  |
 | **Trending This Week**     | Shows papers indexed in the last 7 days (falls back to 30), with a category bar chart                                   |
-| **Weekly Digest**          | One-click Gemini summary of what's new in AI/ML this week based on recent paper titles                                  |
+| **Weekly Digest**          | One-click LLM summary of what's new in AI/ML this week based on recent paper titles                                    |
 | **Weekly email alerts**    | Subscribers receive a personalised digest of matching new papers every Monday via SendGrid                              |
 | **User feedback**          | Thumbs-up / thumbs-down ratings logged to Supabase `feedback` table after every answer                                  |
 | **Session Analytics**      | Query history table, confidence line chart, category usage bar chart, summary metrics                                   |
 | **Top 3 sources sidebar**  | Most relevant papers shown in the sidebar with similarity bars and ArXiv abstract links                                  |
-| **Auto model discovery**   | Probes Gemini models newest-first at startup; survives Google deprecations automatically                                 |
+| **REST API**               | `api.py` exposes the same retrieval/generation logic as a FastAPI HTTP service (`/api/search`, `/api/search/stream`, `/api/summarize`, `/api/papers`) for non-Streamlit clients — currently runs on Gemini independently of the Streamlit app's OpenAI backend |
 | **Idempotent ETL**         | Re-running the pipeline skips already-indexed papers; fetches cs.AI, cs.LG, cs.CL, cs.CV + q-fin subcategories         |
 | **Daily automation**       | GitHub Actions cron runs the ETL every day at 02:00 UTC and pushes new papers into the vector store                    |
 
@@ -61,26 +61,26 @@ ArXiv API  ──(daily)──►  ETL Pipeline  ──►  Supabase / pgvector
                      → embeddings (384-dim)
                      → category stored in metadata
                               │
-User query ──► Gemini router  ──► embed query ──► hybrid search (vector + full-text)
+User query ──► LLM router (gpt-4o-mini) ──► embed query ──► hybrid search (vector + full-text)
                               │
                     top-5 diverse chunks (deduplicated, one per paper first)
                     optionally category-filtered
                               │
             ┌─────── multi-hop? ──────────┐
             │ pass 1 context              │
-            │ Gemini extracts concept     │
+            │ gpt-4o-mini extracts concept│
             │ pass 2 retrieval            │
             └─────────────────────────────┘
                               │
-                    Gemini streaming  ──►  grounded answer + sources
+                    OpenAI streaming  ──►  grounded answer + sources
 ```
 
 1. **Extract** — ArXiv REST API, sorted by submission date descending; categories `cs.AI OR cs.LG OR cs.CL OR cs.CV OR q-fin.ST OR q-fin.CP OR q-fin.PM OR q-fin.TR OR q-fin.RM OR q-fin.MF`; exponential-backoff retry on timeouts and 503s
 2. **Transform** — `pypdf` text extraction → NLTK sentence-boundary chunking (target 800 chars, min 100 chars) → `all-MiniLM-L6-v2` embeddings (384-dim); primary category stored in metadata
 3. **Load** — Supabase PostgreSQL with `pgvector`; duplicate chunks are skipped on re-runs via RPC batch insert
-4. **Route** — Gemini classifies each query as _search / clarify / out-of-scope_ using a structured JSON prompt
+4. **Route** — `gpt-4o-mini` classifies each query as _search / clarify / out-of-scope_ using a structured JSON prompt
 5. **Retrieve** — `hybrid_search` RPC (pgvector cosine + full-text, RRF fusion); falls back to pure vector `match_documents`; results deduplicated and diversified across papers; optionally filtered by category
-6. **Generate** — Retrieved chunks + question → Gemini streaming prompt → answer grounded in paper text; Student Mode injects an undergraduate-friendly suffix into every prompt
+6. **Generate** — Retrieved chunks + question → OpenAI streaming chat completion → answer grounded in paper text; Student Mode injects an undergraduate-friendly suffix into every prompt
 
 ---
 
@@ -100,7 +100,8 @@ User query ──► Gemini router  ──► embed query ──► hybrid searc
 
 | Layer             | Technology                                                           |
 | ----------------- | -------------------------------------------------------------------- |
-| LLM & routing     | Google Gemini (`google-genai` SDK, auto-discovers available model)   |
+| LLM & routing     | OpenAI `gpt-4o-mini` (`openai` SDK, chat completions) — Streamlit app |
+| REST API backend  | Google Gemini (`google-genai` SDK, auto-discovers available model) — `api.py` only, not yet migrated |
 | Vector store      | Supabase — PostgreSQL + `pgvector`                                   |
 | Search            | `hybrid_search` RPC (pgvector + full-text, RRF); fallback vector RPC |
 | Embedding model   | `sentence-transformers/all-MiniLM-L6-v2` (384-dim, runs on CPU)     |
@@ -133,6 +134,10 @@ User query ──► Gemini router  ──► embed query ──► hybrid searc
    ```
    SUPABASE_URL=https://your-project.supabase.co
    SUPABASE_KEY=your-supabase-service-role-key
+   OPENAI_API_KEY=your-openai-api-key
+
+   # Optional — only needed to run the separate FastAPI service (api.py),
+   # which has not yet been migrated off Gemini
    GOOGLE_API_KEY=your-google-ai-studio-key
 
    # Optional — only needed for weekly email alerts
@@ -182,13 +187,17 @@ User query ──► Gemini router  ──► embed query ──► hybrid searc
 ## Project Structure
 
 ```
-├── app.py                    # Streamlit UI — 5 tabs, sidebar, RAG pipeline
+├── app.py                    # Streamlit UI — 5 tabs, sidebar, RAG pipeline (OpenAI gpt-4o-mini)
+├── api.py                    # Optional FastAPI REST layer — same retrieval/generation logic over HTTP (Gemini, not yet migrated)
 ├── etl_pipeline.py           # Extract → Transform → Load (ArXiv → pgvector)
 ├── send_alerts.py            # Weekly email digest via SendGrid
-├── check_models.py           # Lists available Gemini models for debugging
+├── check_models.py           # Lists available Gemini models for debugging api.py's model selection
 ├── supabase_migrations.sql   # DB setup: feedback, paper_alerts tables, hybrid_search RPC
 ├── requirements.txt
 ├── ARCHITECTURE.md           # Deep-dive technical design document
+├── eval/
+│   ├── eval_set.json         # 20-question retrieval eval set (AI/ML + q-fin)
+│   └── run_eval.py           # Computes Hit Rate@5, MRR, mean top-1 similarity
 ├── .streamlit/
 │   └── config.toml           # Dark academic theme (Hugging Face Spaces)
 ├── .github/workflows/

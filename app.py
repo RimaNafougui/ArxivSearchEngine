@@ -6,6 +6,7 @@ import os
 import json
 import re
 import datetime
+import time
 import pandas as pd
 import numpy as np
 import nltk
@@ -24,6 +25,40 @@ supabase = create_client(supabase_url, supabase_key)
 client   = OpenAI(api_key=openai_key)
 
 OPENAI_MODEL = "gpt-4o-mini"
+
+# Basic abuse guard: caps how long a single query can be and how often one
+# browser session can trigger an LLM/Supabase call, so a runaway loop or a
+# single bad actor can't quietly rack up OpenAI/Supabase usage.
+MAX_QUERY_CHARS          = 2000
+RATE_LIMIT_MAX_CALLS     = 20
+RATE_LIMIT_WINDOW_SECONDS = 600  # 10 minutes
+
+
+def _check_query_allowed(text: str) -> str | None:
+    """Return a user-facing warning string if *text* should be blocked, else None.
+
+    Enforces a max query length and a per-session sliding-window rate limit
+    (session_state-scoped, so it limits a single browser session — not a
+    substitute for server-side rate limiting behind a shared deployment, but
+    it stops accidental cost runaway from one session hammering the button).
+    """
+    if text and len(text) > MAX_QUERY_CHARS:
+        return (
+            f"Your question is too long ({len(text)} characters). "
+            f"Please shorten it to {MAX_QUERY_CHARS} characters or fewer."
+        )
+
+    now = time.time()
+    call_times = st.session_state.setdefault("_llm_call_times", [])
+    call_times[:] = [t for t in call_times if now - t < RATE_LIMIT_WINDOW_SECONDS]
+    if len(call_times) >= RATE_LIMIT_MAX_CALLS:
+        return (
+            f"You've reached the limit of {RATE_LIMIT_MAX_CALLS} questions per "
+            f"{RATE_LIMIT_WINDOW_SECONDS // 60} minutes. Please wait a bit and try again."
+        )
+    call_times.append(now)
+    return None
+
 
 # ── 2. CACHED RESOURCES ───────────────────────────────────────────────────────
 @st.cache_resource
@@ -178,7 +213,7 @@ def build_answer_prompt(user_query: str, context_text: str) -> str:
 
 
 def build_answer(user_query: str, context_text: str) -> str | None:
-    """Ask Gemini to synthesise a grounded answer from retrieved context."""
+    """Ask the LLM to synthesise a grounded answer from retrieved context."""
     return call_openai(build_answer_prompt(user_query, context_text))
 
 
@@ -190,7 +225,7 @@ def multihop_retrieve(
     Two-pass retrieval for multi-hop reasoning.
 
     Pass 1 — retrieve papers for the original query.
-    Concept extraction — ask Gemini for the most important related topic not
+    Concept extraction — ask the LLM for the most important related topic not
                          yet covered by the Pass-1 results.
     Pass 2 — retrieve papers for the extracted concept query.
 
@@ -229,7 +264,7 @@ def run_agent(user_query: str) -> tuple[str, dict]:
     """
     Agentic routing via a structured JSON prompt.
 
-    Asks Gemini to return exactly one of:
+    Asks the LLM to return exactly one of:
       {"action":"search",    "query":"<refined query>"}
       {"action":"clarify",   "question":"<clarifying question>"}
       {"action":"no_results","reason":"<scope explanation>"}
@@ -668,7 +703,7 @@ with st.sidebar:
         value=st.session_state.student_mode,
         help=(
             "Appends 'Explain this clearly for an undergraduate student "
-            "with no prior background.' to every Gemini prompt."
+            "with no prior background.' to every LLM prompt."
         ),
     )
 
@@ -778,7 +813,7 @@ st.markdown(f"""
   ">
     Semantic search over <strong style="color:#c7d2fe;">{_n_papers:,} ArXiv papers</strong>
     across cs.AI · cs.LG · cs.CL · cs.CV —
-    Gemini answers from retrieved paper text, not parametric memory.
+    The LLM answers from retrieved paper text, not parametric memory.
     Multi-hop reasoning. Streaming. No hallucination.
   </p>
 
@@ -892,36 +927,40 @@ Ask anything about AI/ML research. The assistant will:
 
         if st.button("Compare", type="primary"):
             if query1 and query2:
-                with st.spinner("Retrieving papers for both queries…"):
-                    m1 = retrieve_documents(query1, category_filter=selected_categories)
-                    m2 = retrieve_documents(query2, category_filter=selected_categories)
+                _block_msg = _check_query_allowed(query1) or _check_query_allowed(query2)
+                if _block_msg:
+                    st.warning(_block_msg)
+                else:
+                    with st.spinner("Retrieving papers for both queries…"):
+                        m1 = retrieve_documents(query1, category_filter=selected_categories)
+                        m2 = retrieve_documents(query2, category_filter=selected_categories)
 
-                ctx1 = context_from_matches(m1)
-                ctx2 = context_from_matches(m2)
+                    ctx1 = context_from_matches(m1)
+                    ctx2 = context_from_matches(m2)
 
-                cmp_prompt = (
-                    f"Compare and contrast what these papers say about "
-                    f'"{query1}" versus "{query2}".'
-                    f"{student_suffix()}\n\n"
-                    f'Papers about "{query1}":\n{ctx1}\n\n'
-                    f'Papers about "{query2}":\n{ctx2}\n\n'
-                    "Comparison:"
-                )
-                with st.spinner("Generating comparison…"):
-                    cmp_ans = call_openai(cmp_prompt)
+                    cmp_prompt = (
+                        f"Compare and contrast what these papers say about "
+                        f'"{query1}" versus "{query2}".'
+                        f"{student_suffix()}\n\n"
+                        f'Papers about "{query1}":\n{ctx1}\n\n'
+                        f'Papers about "{query2}":\n{ctx2}\n\n'
+                        "Comparison:"
+                    )
+                    with st.spinner("Generating comparison…"):
+                        cmp_ans = call_openai(cmp_prompt)
 
-                st.session_state.cmp_answer   = cmp_ans or ""
-                st.session_state.cmp_matches1 = m1
-                st.session_state.cmp_matches2 = m2
+                    st.session_state.cmp_answer   = cmp_ans or ""
+                    st.session_state.cmp_matches1 = m1
+                    st.session_state.cmp_matches2 = m2
 
-                conf = (avg_confidence(m1) + avg_confidence(m2)) / 2
-                st.session_state.query_history.append({
-                    "query":      f"{query1} vs {query2}",
-                    "action":     "comparison",
-                    "confidence": conf,
-                    "timestamp":  datetime.datetime.now().isoformat(),
-                    "categories": _categories_from_matches(m1 + m2),
-                })
+                    conf = (avg_confidence(m1) + avg_confidence(m2)) / 2
+                    st.session_state.query_history.append({
+                        "query":      f"{query1} vs {query2}",
+                        "action":     "comparison",
+                        "confidence": conf,
+                        "timestamp":  datetime.datetime.now().isoformat(),
+                        "categories": _categories_from_matches(m1 + m2),
+                    })
 
         if st.session_state.cmp_answer:
             st.markdown("### Comparison")
@@ -949,119 +988,123 @@ Ask anything about AI/ML research. The assistant will:
             "Deep Search (Multi-hop)",
             help=(
                 "Performs two retrieval passes. Pass 1 finds directly relevant papers; "
-                "Gemini then identifies a related concept and Pass 2 finds additional papers "
+                "gpt-4o-mini then identifies a related concept and Pass 2 finds additional papers "
                 "on that concept. The final answer synthesises both passes."
             ),
         )
 
         if st.button("Search", type="primary") and query:
-            with st.spinner("Analysing your query…"):
-                action, args = run_agent(query)
-
-            if action == "ask_clarification":
-                st.info(
-                    f"**Before I search, could you clarify?**\n\n"
-                    f"{args.get('question', 'Could you provide more detail?')}"
-                )
-                st.session_state.active_answer = ""
-
-            elif action == "report_no_results":
-                st.warning(
-                    f"**This topic appears to be outside my knowledge base.**\n\n"
-                    f"{args.get('explanation', 'The database covers AI/ML and quantitative finance research papers.')}"
-                )
-                st.session_state.active_answer = ""
-
+            _block_msg = _check_query_allowed(query)
+            if _block_msg:
+                st.warning(_block_msg)
             else:
-                refined = args.get("refined_query", query)
+                with st.spinner("Analysing your query…"):
+                    action, args = run_agent(query)
 
-                if deep_search:
-                    # ── Multi-hop path ───────────────────────────────────────
-                    with st.spinner("Pass 1: Searching the vector database…"):
-                        pass1, pass2, hop_query = multihop_retrieve(
-                            refined, category_filter=selected_categories
-                        )
+                if action == "ask_clarification":
+                    st.info(
+                        f"**Before I search, could you clarify?**\n\n"
+                        f"{args.get('question', 'Could you provide more detail?')}"
+                    )
+                    st.session_state.active_answer = ""
 
-                    if not pass1:
-                        st.warning(
-                            "No relevant papers found. Try rephrasing, "
-                            "or ask about a different AI/ML topic."
-                        )
-                        st.session_state.active_answer = ""
-                    else:
-                        if hop_query:
-                            st.caption(f"Pass 2 concept: _{hop_query}_")
+                elif action == "report_no_results":
+                    st.warning(
+                        f"**This topic appears to be outside my knowledge base.**\n\n"
+                        f"{args.get('explanation', 'The database covers AI/ML and quantitative finance research papers.')}"
+                    )
+                    st.session_state.active_answer = ""
 
-                        all_matches = pass1 + pass2
-                        ctx = context_from_matches(all_matches)
-
-                        st.session_state.active_query   = query
-                        st.session_state.active_matches  = all_matches
-                        st.session_state.active_context  = ctx
-                        st.session_state.hop_query       = hop_query
-                        st.session_state.hop_matches     = pass2
-                        st.session_state.is_multihop     = True
-                        st.session_state.action_result   = ""
-                        st.session_state.action_label    = ""
-                        st.session_state.feedback_given  = False
-
-                        synth_prompt = build_answer_prompt(query, ctx)
-                        st.success("Answer synthesised from two retrieval passes:")
-                        streamed = st.write_stream(stream_openai(synth_prompt))
-                        st.session_state.active_answer  = streamed or ""
-                        st.session_state.just_streamed  = True
-                        log_query()
-
-                        conf = avg_confidence(all_matches)
-                        st.session_state.query_history.append({
-                            "query":      query,
-                            "action":     "multihop",
-                            "confidence": conf,
-                            "timestamp":  datetime.datetime.now().isoformat(),
-                            "categories": _categories_from_matches(all_matches),
-                        })
                 else:
-                    # ── Standard single-pass path ────────────────────────────
-                    with st.spinner("Searching the vector database…"):
-                        matches = retrieve_documents(
-                            refined, category_filter=selected_categories
-                        )
+                    refined = args.get("refined_query", query)
 
-                    if not matches:
-                        st.warning(
-                            "No relevant papers found. Try rephrasing, "
-                            "or ask about a different AI/ML topic."
-                        )
-                        st.session_state.active_answer = ""
+                    if deep_search:
+                        # ── Multi-hop path ───────────────────────────────────────
+                        with st.spinner("Pass 1: Searching the vector database…"):
+                            pass1, pass2, hop_query = multihop_retrieve(
+                                refined, category_filter=selected_categories
+                            )
+
+                        if not pass1:
+                            st.warning(
+                                "No relevant papers found. Try rephrasing, "
+                                "or ask about a different AI/ML topic."
+                            )
+                            st.session_state.active_answer = ""
+                        else:
+                            if hop_query:
+                                st.caption(f"Pass 2 concept: _{hop_query}_")
+
+                            all_matches = pass1 + pass2
+                            ctx = context_from_matches(all_matches)
+
+                            st.session_state.active_query   = query
+                            st.session_state.active_matches  = all_matches
+                            st.session_state.active_context  = ctx
+                            st.session_state.hop_query       = hop_query
+                            st.session_state.hop_matches     = pass2
+                            st.session_state.is_multihop     = True
+                            st.session_state.action_result   = ""
+                            st.session_state.action_label    = ""
+                            st.session_state.feedback_given  = False
+
+                            synth_prompt = build_answer_prompt(query, ctx)
+                            st.success("Answer synthesised from two retrieval passes:")
+                            streamed = st.write_stream(stream_openai(synth_prompt))
+                            st.session_state.active_answer  = streamed or ""
+                            st.session_state.just_streamed  = True
+                            log_query()
+
+                            conf = avg_confidence(all_matches)
+                            st.session_state.query_history.append({
+                                "query":      query,
+                                "action":     "multihop",
+                                "confidence": conf,
+                                "timestamp":  datetime.datetime.now().isoformat(),
+                                "categories": _categories_from_matches(all_matches),
+                            })
                     else:
-                        ctx = context_from_matches(matches)
+                        # ── Standard single-pass path ────────────────────────────
+                        with st.spinner("Searching the vector database…"):
+                            matches = retrieve_documents(
+                                refined, category_filter=selected_categories
+                            )
 
-                        st.session_state.active_query   = query
-                        st.session_state.active_matches  = matches
-                        st.session_state.active_context  = ctx
-                        st.session_state.hop_query       = ""
-                        st.session_state.hop_matches     = []
-                        st.session_state.is_multihop     = False
-                        st.session_state.action_result   = ""
-                        st.session_state.action_label    = ""
-                        st.session_state.feedback_given  = False
+                        if not matches:
+                            st.warning(
+                                "No relevant papers found. Try rephrasing, "
+                                "or ask about a different AI/ML topic."
+                            )
+                            st.session_state.active_answer = ""
+                        else:
+                            ctx = context_from_matches(matches)
 
-                        st.success("Answer generated from research papers:")
-                        streamed = st.write_stream(
-                            stream_openai(build_answer_prompt(query, ctx))
-                        )
-                        st.session_state.active_answer  = streamed or ""
-                        st.session_state.just_streamed  = True
-                        log_query()
+                            st.session_state.active_query   = query
+                            st.session_state.active_matches  = matches
+                            st.session_state.active_context  = ctx
+                            st.session_state.hop_query       = ""
+                            st.session_state.hop_matches     = []
+                            st.session_state.is_multihop     = False
+                            st.session_state.action_result   = ""
+                            st.session_state.action_label    = ""
+                            st.session_state.feedback_given  = False
 
-                        conf = avg_confidence(matches)
-                        st.session_state.query_history.append({
-                            "query":      query,
-                            "action":     action,
-                            "confidence": conf,
-                            "timestamp":  datetime.datetime.now().isoformat(),
-                            "categories": _categories_from_matches(matches),
-                        })
+                            st.success("Answer generated from research papers:")
+                            streamed = st.write_stream(
+                                stream_openai(build_answer_prompt(query, ctx))
+                            )
+                            st.session_state.active_answer  = streamed or ""
+                            st.session_state.just_streamed  = True
+                            log_query()
+
+                            conf = avg_confidence(matches)
+                            st.session_state.query_history.append({
+                                "query":      query,
+                                "action":     action,
+                                "confidence": conf,
+                                "timestamp":  datetime.datetime.now().isoformat(),
+                                "categories": _categories_from_matches(matches),
+                            })
 
         # Display persisted answer + UI
         if st.session_state.active_answer:
@@ -1098,7 +1141,7 @@ Ask anything about AI/ML research. The assistant will:
                 with st.expander("Multi-hop Reasoning Trace"):
                     st.markdown(
                         f"**Pass 1** retrieved papers matching your original query.\n\n"
-                        f"**Gemini identified a related concept:** _{st.session_state.hop_query}_\n\n"
+                        f"**gpt-4o-mini identified a related concept:** _{st.session_state.hop_query}_\n\n"
                         f"**Pass 2** retrieved **{len(st.session_state.hop_matches)}** additional "
                         f"paper(s) on that concept. Both passes were combined for the final answer."
                     )
@@ -1599,24 +1642,28 @@ with tab6:
         )
 
         if st.button("Ask", type="primary", key="pdf_ask_btn") and _pdf_q:
-            with st.spinner("Searching PDF…"):
-                _pdf_hits = search_pdf_chunks(_pdf_q, st.session_state.pdf_chunks)
-
-            if not _pdf_hits:
-                st.warning("No relevant passages found in the PDF.")
+            _block_msg = _check_query_allowed(_pdf_q)
+            if _block_msg:
+                st.warning(_block_msg)
             else:
-                _pdf_ctx = "\n\n".join(
-                    f"[Chunk {i+1}]\n{h['content']}"
-                    for i, h in enumerate(_pdf_hits)
-                )
-                _pdf_prompt = build_answer_prompt(_pdf_q, _pdf_ctx)
-                st.success("Answer from your uploaded PDF:")
-                _pdf_streamed = st.write_stream(stream_openai(_pdf_prompt))
+                with st.spinner("Searching PDF…"):
+                    _pdf_hits = search_pdf_chunks(_pdf_q, st.session_state.pdf_chunks)
 
-                st.session_state.pdf_query   = _pdf_q
-                st.session_state.pdf_matches = _pdf_hits
-                st.session_state.pdf_answer  = _pdf_streamed or ""
-                st.session_state.pdf_streamed = True
+                if not _pdf_hits:
+                    st.warning("No relevant passages found in the PDF.")
+                else:
+                    _pdf_ctx = "\n\n".join(
+                        f"[Chunk {i+1}]\n{h['content']}"
+                        for i, h in enumerate(_pdf_hits)
+                    )
+                    _pdf_prompt = build_answer_prompt(_pdf_q, _pdf_ctx)
+                    st.success("Answer from your uploaded PDF:")
+                    _pdf_streamed = st.write_stream(stream_openai(_pdf_prompt))
+
+                    st.session_state.pdf_query   = _pdf_q
+                    st.session_state.pdf_matches = _pdf_hits
+                    st.session_state.pdf_answer  = _pdf_streamed or ""
+                    st.session_state.pdf_streamed = True
 
         if st.session_state.pdf_answer and not st.session_state.pdf_streamed:
             st.success("Answer from your uploaded PDF:")
